@@ -1,0 +1,4 @@
+PLATFORM=rocm
+DEVICE=mi300a
+HOST=odyssey
+

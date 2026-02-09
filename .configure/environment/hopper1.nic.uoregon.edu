@@ -1,0 +1,4 @@
+PLATFORM=cuda
+DEVICE=gh200
+HOST=hopper1
+
