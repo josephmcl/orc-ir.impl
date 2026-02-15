@@ -25,7 +25,7 @@ endif
 toolkit_makefile_file = $(toolkit_makefile_path)/$(toolkit).$(device) 
 ifneq ("$(wildcard $(toolkit_makefile_file))","")
 	toolkit_makefile_exists := 1
-	# -include $(toolkit_makefile_file)
+	-include $(toolkit_makefile_file)
 else
 	toolkit_makefile_exists := 0
 endif
@@ -57,7 +57,7 @@ $(info $(red)(error)$(reset)$(1))
 endef
 # ----------------------------------------------------------------- #
 
-all: environment makefile
+all: environment makefile generate
 
 # Verify that the envrionment file exists and is loaded. Otherwise, 
 # notify the user. 

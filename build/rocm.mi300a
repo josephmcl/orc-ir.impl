@@ -1,0 +1,55 @@
+# build/rocm.mi300a -- ROCm MI300A build rules
+# included by the top-level Makefile
+
+HIPCC     := hipcc
+HIP_ARCH  := gfx942
+HIP_STD   := -std=c++17
+HIP_OPT   := -O3
+HIP_FLAGS := $(HIP_STD) $(HIP_OPT) --offload-arch=$(HIP_ARCH)
+HIP_INC   := -Iinclude
+HIP_LIBS  := -lrocblas -lrocsolver -lhiprand
+
+# ----------------------------------------------------------------- #
+# source files
+
+common_src := source/common/artifact.cpp source/common/cli.cpp
+
+rocm_src := source/rocm/generate.cpp \
+            source/rocm/factor.cpp    \
+            source/rocm/linalg.cpp    \
+            source/rocm/random.cpp
+
+# ----------------------------------------------------------------- #
+# object directory
+
+obj_dir := $(target_directory)/$(environment_slug)/obj
+
+common_obj := $(patsubst source/common/%.cpp,$(obj_dir)/common/%.o,$(common_src))
+rocm_obj   := $(patsubst source/rocm/%.cpp,$(obj_dir)/rocm/%.o,$(rocm_src))
+
+# ----------------------------------------------------------------- #
+# directory creation
+
+$(obj_dir)/common $(obj_dir)/rocm:
+	mkdir -p $@
+
+# ----------------------------------------------------------------- #
+# compilation rules
+
+$(obj_dir)/common/%.o: source/common/%.cpp | $(obj_dir)/common
+	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
+
+$(obj_dir)/rocm/%.o: source/rocm/%.cpp | $(obj_dir)/rocm
+	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
+
+# ----------------------------------------------------------------- #
+# link targets
+
+generate_bin := $(target_directory)/$(environment_slug)/generate
+
+$(generate_bin): $(common_obj) $(rocm_obj)
+	$(HIPCC) $(HIP_FLAGS) $^ $(HIP_LIBS) -o $@
+
+.PHONY: generate
+generate: $(generate_bin)
+	$(call status, Built generate -> $(generate_bin))
