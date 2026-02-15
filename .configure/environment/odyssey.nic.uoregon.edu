@@ -3,3 +3,4 @@ DEVICE=mi300a
 HOST=odyssey
 TOOLKIT=rocm
 TOOLKIT_VERSION=7.1.1
+export XNACK=1

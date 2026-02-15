@@ -22,24 +22,24 @@ rocm_src := source/rocm/generate.cpp \
 # ----------------------------------------------------------------- #
 # object directory
 
-object_directory := object/$(environment_slug)
+local_object_directory := object/$(environment_slug)
 
-common_obj := $(patsubst source/common/%.cpp,$(object_directory)/common/%.o,$(common_src))
-rocm_obj   := $(patsubst source/rocm/%.cpp,$(object_directory)/rocm/%.o,$(rocm_src))
+common_obj := $(patsubst source/common/%.cpp,$(local_object_directory)/common/%.o,$(common_src))
+rocm_obj   := $(patsubst source/rocm/%.cpp,$(local_object_directory)/rocm/%.o,$(rocm_src))
 
 # ----------------------------------------------------------------- #
 # directory creation
 
-$(object_directory)/common $(object_directory)/rocm $(target_directory)/$(environment_slug):
+$(local_object_directory)/common $(local_object_directory)/rocm $(target_directory)/$(environment_slug):
 	mkdir -p $@
 
 # ----------------------------------------------------------------- #
 # compilation rules
 
-$(object_directory)/common/%.o: source/common/%.cpp | $(object_directory)/common
+$(local_object_directory)/common/%.o: source/common/%.cpp | $(local_object_directory)/common
 	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
 
-$(object_directory)/rocm/%.o: source/rocm/%.cpp | $(object_directory)/rocm
+$(local_object_directory)/rocm/%.o: source/rocm/%.cpp | $(local_object_directory)/rocm
 	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
 
 # ----------------------------------------------------------------- #
