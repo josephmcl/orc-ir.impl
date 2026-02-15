@@ -8,6 +8,7 @@ hostname = $(shell hostname -f)
 
 environment_path      := ./.configure/environment
 toolkit_makefile_path := build
+target_directory      := target
 
 environment_file = $(environment_path)/$(hostname) 
 ifneq ("$(wildcard $(environment_file))","") 
@@ -30,10 +31,11 @@ else
 	toolkit_makefile_exists := 0
 endif
 
-target_directory := target
 target = $(target_directory)/$(environment_slug)/$(target_file)
+
+.DEFAULT_GOAL := all
 # ----------------------------------------------------------------- #
-# Pretty printing and error reporting. 
+# Pretty printing and error reporting.
 
 # Ascii color variables 
 esc   := $(shell printf '\033')
@@ -57,7 +59,14 @@ $(info $(red)(error)$(reset)$(1))
 endef
 # ----------------------------------------------------------------- #
 
-all: environment makefile generate
+all: environment build-rules generate symlinks
+
+.PHONY: symlinks
+symlinks: generate
+	@ln -sf $(generate_bin) ./generate
+	$(call status, Synchronized symbolic links to latest targets.\
+	$(endl)$(endl)\
+	$(blue)      generate ~ $(generate_bin)$(reset)$(endl))
 
 # Verify that the envrionment file exists and is loaded. Otherwise, 
 # notify the user. 
@@ -75,8 +84,8 @@ else
 	for further direction.)
 endif
 
-.PHONY: makefile
-makefile:
+.PHONY: build-rules
+build-rules:
 ifeq ($(toolkit_makefile_exists),1)
 	$(call status, Loaded build instructions.)
 else
@@ -87,8 +96,8 @@ else
 	Add one to the build directory; see the README for $(endl)\
 	further direction.)
 endif
+.PHONY: clean
+clean:
+	rm -rf object target ./generate
+	$(call status, Cleaned.)
 # ----------------------------------------------------------------- #
-#
-#
-#
-#

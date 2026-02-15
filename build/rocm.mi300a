@@ -22,24 +22,24 @@ rocm_src := source/rocm/generate.cpp \
 # ----------------------------------------------------------------- #
 # object directory
 
-obj_dir := $(target_directory)/$(environment_slug)/obj
+object_directory := object/$(environment_slug)
 
-common_obj := $(patsubst source/common/%.cpp,$(obj_dir)/common/%.o,$(common_src))
-rocm_obj   := $(patsubst source/rocm/%.cpp,$(obj_dir)/rocm/%.o,$(rocm_src))
+common_obj := $(patsubst source/common/%.cpp,$(object_directory)/common/%.o,$(common_src))
+rocm_obj   := $(patsubst source/rocm/%.cpp,$(object_directory)/rocm/%.o,$(rocm_src))
 
 # ----------------------------------------------------------------- #
 # directory creation
 
-$(obj_dir)/common $(obj_dir)/rocm:
+$(object_directory)/common $(object_directory)/rocm $(target_directory)/$(environment_slug):
 	mkdir -p $@
 
 # ----------------------------------------------------------------- #
 # compilation rules
 
-$(obj_dir)/common/%.o: source/common/%.cpp | $(obj_dir)/common
+$(object_directory)/common/%.o: source/common/%.cpp | $(object_directory)/common
 	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
 
-$(obj_dir)/rocm/%.o: source/rocm/%.cpp | $(obj_dir)/rocm
+$(object_directory)/rocm/%.o: source/rocm/%.cpp | $(object_directory)/rocm
 	$(HIPCC) $(HIP_FLAGS) $(HIP_INC) -c $< -o $@
 
 # ----------------------------------------------------------------- #
@@ -47,9 +47,11 @@ $(obj_dir)/rocm/%.o: source/rocm/%.cpp | $(obj_dir)/rocm
 
 generate_bin := $(target_directory)/$(environment_slug)/generate
 
-$(generate_bin): $(common_obj) $(rocm_obj)
+$(generate_bin): $(common_obj) $(rocm_obj) | $(target_directory)/$(environment_slug)
 	$(HIPCC) $(HIP_FLAGS) $^ $(HIP_LIBS) -o $@
 
 .PHONY: generate
 generate: $(generate_bin)
-	$(call status, Built generate -> $(generate_bin))
+	$(call status, Built problem generation target. \
+    $(endl) $(endl)\
+	$(blue)      $(generate_bin)$(reset)$(endl))
