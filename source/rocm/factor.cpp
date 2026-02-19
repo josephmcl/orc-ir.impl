@@ -371,3 +371,105 @@ void solve_cholesky_trsm<float>(gpu_context &ctx,
         d_b, rn, stride_b,
         (rocblas_int)batch));
 }
+
+/* -------------------------------------------------------- */
+/* individual solve steps for instrumented timing           */
+
+/* apply row pivots from getrf */
+
+template <typename T>
+void apply_pivots(gpu_context &ctx,
+                  T *d_b, size_t n,
+                  rocblas_int *d_ipiv,
+                  size_t nrhs, size_t batch);
+
+template <>
+void apply_pivots<double>(gpu_context &ctx,
+                           double *d_b, size_t n,
+                           rocblas_int *d_ipiv,
+                           size_t nrhs,
+                           size_t batch) {
+    rocblas_int rn    = (rocblas_int)n;
+    rocblas_int rnrhs = (rocblas_int)nrhs;
+    for (size_t b = 0; b < batch; b++) {
+        ROCBLAS_CHECK(rocsolver_dlaswp(
+            ctx.blas_handle, rnrhs,
+            d_b + b * n * nrhs, rn,
+            1, rn, d_ipiv + b * n, 1));
+    }
+}
+
+template <>
+void apply_pivots<float>(gpu_context &ctx,
+                          float *d_b, size_t n,
+                          rocblas_int *d_ipiv,
+                          size_t nrhs,
+                          size_t batch) {
+    rocblas_int rn    = (rocblas_int)n;
+    rocblas_int rnrhs = (rocblas_int)nrhs;
+    for (size_t b = 0; b < batch; b++) {
+        ROCBLAS_CHECK(rocsolver_slaswp(
+            ctx.blas_handle, rnrhs,
+            d_b + b * n * nrhs, rn,
+            1, rn, d_ipiv + b * n, 1));
+    }
+}
+
+/* single trsm step with configurable parameters */
+
+template <typename T>
+void trsm_step(gpu_context &ctx,
+               rocblas_fill fill,
+               rocblas_operation trans,
+               rocblas_diagonal diag,
+               T *d_a, T *d_b,
+               size_t n, size_t nrhs,
+               size_t batch);
+
+template <>
+void trsm_step<double>(gpu_context &ctx,
+                        rocblas_fill fill,
+                        rocblas_operation trans,
+                        rocblas_diagonal diag,
+                        double *d_a, double *d_b,
+                        size_t n, size_t nrhs,
+                        size_t batch) {
+    rocblas_int rn    = (rocblas_int)n;
+    rocblas_int rnrhs = (rocblas_int)nrhs;
+    double one = 1.0;
+    rocblas_stride stride_a = (rocblas_stride)n * n;
+    rocblas_stride stride_b =
+        (rocblas_stride)n * nrhs;
+
+    ROCBLAS_CHECK(rocblas_dtrsm_strided_batched(
+        ctx.blas_handle,
+        rocblas_side_left, fill, trans, diag,
+        rn, rnrhs, &one,
+        d_a, rn, stride_a,
+        d_b, rn, stride_b,
+        (rocblas_int)batch));
+}
+
+template <>
+void trsm_step<float>(gpu_context &ctx,
+                       rocblas_fill fill,
+                       rocblas_operation trans,
+                       rocblas_diagonal diag,
+                       float *d_a, float *d_b,
+                       size_t n, size_t nrhs,
+                       size_t batch) {
+    rocblas_int rn    = (rocblas_int)n;
+    rocblas_int rnrhs = (rocblas_int)nrhs;
+    float one = 1.0f;
+    rocblas_stride stride_a = (rocblas_stride)n * n;
+    rocblas_stride stride_b =
+        (rocblas_stride)n * nrhs;
+
+    ROCBLAS_CHECK(rocblas_strsm_strided_batched(
+        ctx.blas_handle,
+        rocblas_side_left, fill, trans, diag,
+        rn, rnrhs, &one,
+        d_a, rn, stride_a,
+        d_b, rn, stride_b,
+        (rocblas_int)batch));
+}

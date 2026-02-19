@@ -35,6 +35,21 @@ void solve_cholesky_trsm(gpu_context &ctx, T *d_l,
                           size_t n, T *d_b,
                           size_t nrhs, size_t batch);
 
+template <typename T>
+void apply_pivots(gpu_context &ctx,
+                  T *d_b, size_t n,
+                  rocblas_int *d_ipiv,
+                  size_t nrhs, size_t batch);
+
+template <typename T>
+void trsm_step(gpu_context &ctx,
+               rocblas_fill fill,
+               rocblas_operation trans,
+               rocblas_diagonal diag,
+               T *d_a, T *d_b,
+               size_t n, size_t nrhs,
+               size_t batch);
+
 /* -------------------------------------------------------- */
 /* forward declaration from ir_solve.cpp                    */
 
@@ -271,11 +286,30 @@ void run_solve(gpu_context &ctx,
     };
 
     /* set up profiler and timers */
+    bool instrument_phases =
+        (variant == solve_variant::rocblastrsv)
+        && (cfg.mode == profile_mode::instrument
+         || cfg.mode ==
+              profile_mode::instrument_verify);
+
+    size_t num_phases = 1;
+    if (instrument_phases) {
+        if (cfg.desc.factor == factor_type::lu)
+            num_phases = 3;
+        else
+            num_phases = 2;
+    }
+
     profiler prof;
-    prof.init(cfg, 1, 1);
+    prof.init(cfg, num_phases,
+              do_verify ? 1 : 0);
 
     gpu_timer timer;
-    timer.init();
+    gpu_timer_pool timer_pool;
+    if (instrument_phases)
+        timer_pool.init(num_phases);
+    else
+        timer.init();
 
     /* pre-allocate verification buffers */
     std::vector<T> h_x_work;
@@ -309,13 +343,76 @@ void run_solve(gpu_context &ctx,
             rhs_elems * sizeof(T),
             hipMemcpyDeviceToDevice, ctx.stream));
 
-        timer.start(ctx.stream);
-        do_solve();
-        timer.stop(ctx.stream);
-        timer.synchronize();
+        if (instrument_phases) {
+            timer_pool.reset();
 
-        prof.record_gpu_time("solve",
-                             timer.elapsed_ms());
+            if (cfg.desc.factor == factor_type::lu) {
+                timer_pool.start(0, ctx.stream);
+                apply_pivots(ctx, d_x, n,
+                    d_ipiv, nrhs, batch);
+                timer_pool.stop(0, ctx.stream);
+
+                timer_pool.start(1, ctx.stream);
+                trsm_step(ctx,
+                    rocblas_fill_lower,
+                    rocblas_operation_none,
+                    rocblas_diagonal_unit,
+                    d_factor, d_x, n, nrhs,
+                    batch);
+                timer_pool.stop(1, ctx.stream);
+
+                timer_pool.start(2, ctx.stream);
+                trsm_step(ctx,
+                    rocblas_fill_upper,
+                    rocblas_operation_none,
+                    rocblas_diagonal_non_unit,
+                    d_factor, d_x, n, nrhs,
+                    batch);
+                timer_pool.stop(2, ctx.stream);
+            } else {
+                timer_pool.start(0, ctx.stream);
+                trsm_step(ctx,
+                    rocblas_fill_lower,
+                    rocblas_operation_none,
+                    rocblas_diagonal_non_unit,
+                    d_factor, d_x, n, nrhs,
+                    batch);
+                timer_pool.stop(0, ctx.stream);
+
+                timer_pool.start(1, ctx.stream);
+                trsm_step(ctx,
+                    rocblas_fill_lower,
+                    rocblas_operation_transpose,
+                    rocblas_diagonal_non_unit,
+                    d_factor, d_x, n, nrhs,
+                    batch);
+                timer_pool.stop(1, ctx.stream);
+            }
+
+            timer_pool.synchronize_all();
+
+            if (cfg.desc.factor == factor_type::lu) {
+                prof.record_gpu_time("laswp",
+                    timer_pool.elapsed_ms(0));
+                prof.record_gpu_time("trsm_L",
+                    timer_pool.elapsed_ms(1));
+                prof.record_gpu_time("trsm_U",
+                    timer_pool.elapsed_ms(2));
+            } else {
+                prof.record_gpu_time("trsm_L",
+                    timer_pool.elapsed_ms(0));
+                prof.record_gpu_time("trsm_LT",
+                    timer_pool.elapsed_ms(1));
+            }
+        } else {
+            timer.start(ctx.stream);
+            do_solve();
+            timer.stop(ctx.stream);
+            timer.synchronize();
+
+            prof.record_gpu_time("solve",
+                                 timer.elapsed_ms());
+        }
 
         if (do_verify) {
             HIP_CHECK(hipMemcpy(
@@ -348,7 +445,10 @@ void run_solve(gpu_context &ctx,
     prof.write_csv();
 
     /* cleanup */
-    timer.destroy();
+    if (instrument_phases)
+        timer_pool.destroy();
+    else
+        timer.destroy();
     prof.destroy();
 
     if (d_ipiv) HIP_CHECK(hipFree(d_ipiv));

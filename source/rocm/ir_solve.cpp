@@ -45,6 +45,33 @@ static double compute_residual_lower(
 }
 
 /* -------------------------------------------------------- */
+/* host-side forward error:
+   ||x_computed - x_true||_inf / ||x_true||_inf
+   for a single batch element.                              */
+
+static double compute_forward_error(
+    const double *x_computed,
+    const double *x_true,
+    size_t n, size_t batch_idx)
+{
+    size_t off = batch_idx * n;
+    double max_diff = 0.0;
+    double max_true = 0.0;
+
+    for (size_t i = 0; i < n; i++) {
+        double d = std::abs(
+            x_computed[off + i]
+            - x_true[off + i]);
+        if (d > max_diff) max_diff = d;
+        double t = std::abs(x_true[off + i]);
+        if (t > max_true) max_true = t;
+    }
+
+    if (max_true == 0.0) return max_diff;
+    return max_diff / max_true;
+}
+
+/* -------------------------------------------------------- */
 /* run_ir3_solve: Higham Algorithm 4
    3-precision iterative refinement
 
@@ -80,6 +107,9 @@ void run_ir3_solve(gpu_context &ctx,
     size_t mat_elems = batch * n * n;
     size_t vec_elems = batch * n;
 
+    bool instrument =
+        cfg.mode == profile_mode::instrument
+     || cfg.mode == profile_mode::instrument_verify;
     bool do_verify =
         cfg.mode == profile_mode::instrument_verify;
 
@@ -99,6 +129,15 @@ void run_ir3_solve(gpu_context &ctx,
     read_array(dir + "/b.bin",
                h_b.data(),
                vec_elems * sizeof(double));
+
+    /* load true solution for forward error */
+    std::vector<double> h_x_true;
+    if (do_verify) {
+        h_x_true.resize(vec_elems);
+        read_array(dir + "/x_l.bin",
+                   h_x_true.data(),
+                   vec_elems * sizeof(double));
+    }
 
     /* ---------------------------------------------------- */
     /* upload L (fp64) to GPU for dgemv residual            */
@@ -203,114 +242,144 @@ void run_ir3_solve(gpu_context &ctx,
               << max_ir_iters << ")\n";
 
     /* ---------------------------------------------------- */
-    /* dgemv parameters and strides                         */
+    /* dgemv parameters                                     */
 
     int lda = (int)n;
     long long stride_a = (long long)n * n;
     long long stride_x = (long long)n;
 
-    /* r = beta*r + alpha*L*x64
-       with alpha=-1, beta=1 gives r = r - L*x64
-       (r is pre-loaded with b, so r = b - L*x64) */
     double alpha_neg = -1.0;
     double beta_one  =  1.0;
 
     /* ---------------------------------------------------- */
-    /* IR iteration (enqueue only, no sync)                 */
+    /* IR phase lambdas (GPU work only, no sync)            */
 
-    auto do_ir = [&]() {
-        HIP_CHECK(hipMemsetAsync(d_x64, 0,
-            vec_elems * sizeof(double),
-            ctx.stream));
+    auto phase_residual = [&]() {
+        for (size_t bi = 0; bi < batch; bi++) {
+            HIP_CHECK(hipMemcpyAsync(
+                d_r + bi * stride_x,
+                d_b + bi * stride_x,
+                n * sizeof(double),
+                hipMemcpyDeviceToDevice,
+                ctx.stream));
 
-        for (size_t iter = 0;
-             iter < max_ir_iters; iter++) {
-
-            /* 1. residual: r = b - L * x64
-               via rocblas dgemv per batch */
-            for (size_t bi = 0; bi < batch; bi++) {
-                HIP_CHECK(hipMemcpyAsync(
-                    d_r + bi * stride_x,
-                    d_b + bi * stride_x,
-                    n * sizeof(double),
-                    hipMemcpyDeviceToDevice,
-                    ctx.stream));
-
-                ROCBLAS_CHECK(rocblas_dgemv(
-                    ctx.blas_handle,
-                    rocblas_operation_none,
-                    (rocblas_int)n, (rocblas_int)n,
-                    &alpha_neg,
-                    d_l + bi * stride_a, lda,
-                    d_x64 + bi * stride_x, 1,
-                    &beta_one,
-                    d_r + bi * stride_x, 1));
-            }
-
-            /* 2. adaptive pow2 scale + demote
-               r to fp16 */
-            hipLaunchKernelGGL(
-                gpu_max_norm_kernel,
-                dim3(nblocks_r), dim3(tpb),
-                shmem_size, ctx.stream,
-                d_r, d_block_maxes,
-                (int)(vec_elems));
-
-            hipLaunchKernelGGL(
-                gpu_compute_pow2_scale_kernel,
-                dim3(1), dim3(1),
-                0, ctx.stream,
-                d_block_maxes, d_scale_b,
-                d_norm, nblocks_r);
-
-            hipLaunchKernelGGL(
-                gpu_apply_scale_and_demote_kernel,
-                dim3(nblocks_r), dim3(tpb),
-                0, ctx.stream,
-                d_r, d_x16, d_scale_b,
-                (int)(vec_elems));
-
-            /* 3. solve: L16 * delta16 = r16
-               via multi-CU block-column TRSV */
-            launch_trsv_multiCU_fp16<
-                MC_TRSV_TILE_SIZE, MC_TRSV_TPB>(
-                ctx.stream,
-                (int)n, lda, stride_a, d_l16,
-                stride_x, d_x16, (int)batch,
-                d_rhs_workspace, d_workspace);
-
-            /* 4. update: x64 += delta16 *
-               (scale_b * inv_scale_A)
-               TRSV solved (L/scale_A)*delta =
-               r/scale_b, so true delta =
-               delta16 * scale_b / scale_A */
-            hipLaunchKernelGGL(
-                gpu_scalar_multiply_kernel,
-                dim3(1), dim3(1),
-                0, ctx.stream,
-                d_correction_scale,
-                d_scale_b, inv_scale_A);
-
-            hipLaunchKernelGGL(
-                gpu_promote_and_add_kernel_devscale,
-                dim3(nblocks_r), dim3(tpb),
-                0, ctx.stream,
-                d_x16, d_x64,
-                d_correction_scale,
-                (int)(vec_elems));
+            ROCBLAS_CHECK(rocblas_dgemv(
+                ctx.blas_handle,
+                rocblas_operation_none,
+                (rocblas_int)n, (rocblas_int)n,
+                &alpha_neg,
+                d_l + bi * stride_a, lda,
+                d_x64 + bi * stride_x, 1,
+                &beta_one,
+                d_r + bi * stride_x, 1));
         }
     };
 
+    auto phase_scale = [&]() {
+        hipLaunchKernelGGL(
+            gpu_max_norm_kernel,
+            dim3(nblocks_r), dim3(tpb),
+            shmem_size, ctx.stream,
+            d_r, d_block_maxes,
+            (int)(vec_elems));
+
+        hipLaunchKernelGGL(
+            gpu_compute_pow2_scale_kernel,
+            dim3(1), dim3(1),
+            0, ctx.stream,
+            d_block_maxes, d_scale_b,
+            d_norm, nblocks_r);
+
+        hipLaunchKernelGGL(
+            gpu_apply_scale_and_demote_kernel,
+            dim3(nblocks_r), dim3(tpb),
+            0, ctx.stream,
+            d_r, d_x16, d_scale_b,
+            (int)(vec_elems));
+    };
+
+    auto phase_trsv = [&]() {
+        launch_trsv_multiCU_fp16<
+            MC_TRSV_TILE_SIZE, MC_TRSV_TPB>(
+            ctx.stream,
+            (int)n, lda, stride_a, d_l16,
+            stride_x, d_x16, (int)batch,
+            d_rhs_workspace, d_workspace);
+    };
+
+    auto phase_update = [&]() {
+        hipLaunchKernelGGL(
+            gpu_scalar_multiply_kernel,
+            dim3(1), dim3(1),
+            0, ctx.stream,
+            d_correction_scale,
+            d_scale_b, inv_scale_A);
+
+        hipLaunchKernelGGL(
+            gpu_promote_and_add_kernel_devscale,
+            dim3(nblocks_r), dim3(tpb),
+            0, ctx.stream,
+            d_x16, d_x64,
+            d_correction_scale,
+            (int)(vec_elems));
+    };
+
     /* ---------------------------------------------------- */
-    /* set up profiler and timer                            */
+    /* persistent labels for per-iteration recording        */
+
+    std::vector<std::string> time_strs;
+    std::vector<const char *> time_labels;
+    std::vector<std::string> verify_strs;
+    std::vector<const char *> verify_labels;
+
+    if (instrument) {
+        time_strs.resize(4 * max_ir_iters);
+        time_labels.resize(4 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            time_strs[4*i+0] = pfx + "residual";
+            time_strs[4*i+1] = pfx + "scale";
+            time_strs[4*i+2] = pfx + "trsv";
+            time_strs[4*i+3] = pfx + "update";
+            for (int j = 0; j < 4; j++)
+                time_labels[4*i+j] =
+                    time_strs[4*i+j].c_str();
+        }
+    }
+
+    if (do_verify) {
+        verify_strs.resize(2 * max_ir_iters);
+        verify_labels.resize(2 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            verify_strs[2*i+0] = pfx + "bwd_error";
+            verify_strs[2*i+1] = pfx + "fwd_error";
+            for (int j = 0; j < 2; j++)
+                verify_labels[2*i+j] =
+                    verify_strs[2*i+j].c_str();
+        }
+    }
+
+    /* ---------------------------------------------------- */
+    /* set up profiler and timers                           */
+
+    size_t events_per_run = instrument
+        ? 4 * max_ir_iters : 1;
+    size_t verify_per_run = do_verify
+        ? 2 * max_ir_iters : 0;
 
     profiler prof;
-    prof.init(cfg, 1, 1);
+    prof.init(cfg, events_per_run, verify_per_run);
 
     gpu_timer timer;
-    timer.init();
+    gpu_timer_pool timers;
+    if (instrument)
+        timers.init(4);
+    else
+        timer.init();
 
-    /* pre-allocate verification buffers */
     std::vector<double> h_x64;
     if (do_verify)
         h_x64.resize(vec_elems);
@@ -322,7 +391,18 @@ void run_ir3_solve(gpu_context &ctx,
               << " runs)...\n";
     prof.begin_warmup();
     for (size_t w = 0; w < cfg.warmup_runs; w++) {
-        do_ir();
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
+
+        for (size_t iter = 0;
+             iter < max_ir_iters; iter++) {
+            phase_residual();
+            phase_scale();
+            phase_trsv();
+            phase_update();
+        }
+
         HIP_CHECK(
             hipStreamSynchronize(ctx.stream));
     }
@@ -336,32 +416,101 @@ void run_ir3_solve(gpu_context &ctx,
     for (size_t r = 0; r < cfg.measured_runs; r++) {
         prof.begin_run();
 
-        timer.start(ctx.stream);
-        do_ir();
-        timer.stop(ctx.stream);
-        timer.synchronize();
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
 
-        prof.record_gpu_time("ir_solve",
-                             timer.elapsed_ms());
+        if (instrument) {
+            HIP_CHECK(hipStreamSynchronize(
+                ctx.stream));
 
-        if (do_verify) {
-            HIP_CHECK(hipMemcpy(
-                h_x64.data(), d_x64,
-                vec_elems * sizeof(double),
-                hipMemcpyDeviceToHost));
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                timers.reset();
 
-            double max_resid = 0.0;
-            for (size_t i = 0; i < batch; i++) {
-                double res =
-                    compute_residual_lower(
-                        h_l.data(),
-                        h_x64.data(),
-                        h_b.data(), n, i);
-                if (res > max_resid)
-                    max_resid = res;
+                timers.start(0, ctx.stream);
+                phase_residual();
+                timers.stop(0, ctx.stream);
+
+                timers.start(1, ctx.stream);
+                phase_scale();
+                timers.stop(1, ctx.stream);
+
+                timers.start(2, ctx.stream);
+                phase_trsv();
+                timers.stop(2, ctx.stream);
+
+                timers.start(3, ctx.stream);
+                phase_update();
+                timers.stop(3, ctx.stream);
+
+                timers.synchronize_all();
+
+                prof.record_gpu_time(
+                    time_labels[4*iter+0],
+                    timers.elapsed_ms(0));
+                prof.record_gpu_time(
+                    time_labels[4*iter+1],
+                    timers.elapsed_ms(1));
+                prof.record_gpu_time(
+                    time_labels[4*iter+2],
+                    timers.elapsed_ms(2));
+                prof.record_gpu_time(
+                    time_labels[4*iter+3],
+                    timers.elapsed_ms(3));
+
+                if (do_verify) {
+                    HIP_CHECK(hipMemcpy(
+                        h_x64.data(), d_x64,
+                        vec_elems * sizeof(double),
+                        hipMemcpyDeviceToHost));
+
+                    double max_bwd = 0.0;
+                    double max_fwd = 0.0;
+                    for (size_t bi = 0;
+                         bi < batch; bi++) {
+                        double bwd =
+                            compute_residual_lower(
+                                h_l.data(),
+                                h_x64.data(),
+                                h_b.data(),
+                                n, bi);
+                        if (bwd > max_bwd)
+                            max_bwd = bwd;
+                        double fwd =
+                            compute_forward_error(
+                                h_x64.data(),
+                                h_x_true.data(),
+                                n, bi);
+                        if (fwd > max_fwd)
+                            max_fwd = fwd;
+                    }
+
+                    prof.record_metric(
+                        verify_labels[2*iter+0],
+                        max_bwd);
+                    prof.record_metric(
+                        verify_labels[2*iter+1],
+                        max_fwd);
+                }
             }
-            prof.record_metric("residual",
-                               max_resid);
+        } else {
+            /* profile mode: single timer around
+               entire IR solve */
+            timer.start(ctx.stream);
+
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                phase_residual();
+                phase_scale();
+                phase_trsv();
+                phase_update();
+            }
+
+            timer.stop(ctx.stream);
+            timer.synchronize();
+            prof.record_gpu_time("ir_solve",
+                timer.elapsed_ms());
         }
 
         prof.end_run();
@@ -373,7 +522,10 @@ void run_ir3_solve(gpu_context &ctx,
     /* ---------------------------------------------------- */
     /* cleanup                                              */
 
-    timer.destroy();
+    if (instrument)
+        timers.destroy();
+    else
+        timer.destroy();
     prof.destroy();
 
     HIP_CHECK(hipFree(d_norm));
