@@ -107,10 +107,16 @@ void print_profiler_usage(const char *prog) {
            "batch size (default: 1)\n"
         << "  --nrhs K                 "
            "number of rhs (default: 1)\n"
-        << "  --precision {fp64|fp32}  "
-           "working precision (default: fp64)\n"
         << "  --solver NAME            "
-           "solver identifier (required)\n"
+           "solver variant (required)\n"
+        << "         rocblas64          "
+           "rocsolver getrs/potrs, fp64\n"
+        << "         rocblas32          "
+           "rocsolver getrs/potrs, fp32\n"
+        << "         rocblastrsv64      "
+           "rocblas trsm, fp64\n"
+        << "         rocblastrsv32      "
+           "rocblas trsm, fp32\n"
         << "  --mode {profile|instrument"
            "|instrument_verify}\n"
         << "                           "
@@ -177,22 +183,6 @@ profiler_cli_args parse_profiler_args(
             args.config.desc.batch = std::stoul(val);
         } else if (arg == "--nrhs") {
             args.config.desc.nrhs = std::stoul(val);
-        } else if (arg == "--precision") {
-            if (val == "fp64")
-                args.config.desc.working_prec =
-                    precision::fp64;
-            else if (val == "fp32")
-                args.config.desc.working_prec =
-                    precision::fp32;
-            else if (val == "fp16")
-                args.config.desc.working_prec =
-                    precision::fp16;
-            else {
-                std::cerr << "error: unknown "
-                          << "precision '"
-                          << val << "'\n";
-                exit(1);
-            }
         } else if (arg == "--solver") {
             args.config.solver_name = argv[i];
             have_solver = true;

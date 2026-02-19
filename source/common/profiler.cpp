@@ -111,7 +111,7 @@ void profiler::record_time(const char *label,
 }
 
 /* -------------------------------------------------------- */
-/* verification metrics                                    */
+/* verification metrics                                     */
 
 void profiler::record_metric(const char *name,
                              double value) {
@@ -124,7 +124,7 @@ void profiler::record_metric(const char *name,
 }
 
 /* -------------------------------------------------------- */
-/* output path                                             */
+/* output path                                              */
 
 std::string profiler::output_path() const {
     std::string slug = problem_slug(config.desc);
@@ -136,7 +136,7 @@ std::string profiler::output_path() const {
 }
 
 /* -------------------------------------------------------- */
-/* CSV output                                              */
+/* CSV output                                               */
 
 void profiler::write_csv() const {
     std::string path = output_path();
@@ -206,7 +206,7 @@ void profiler::write_csv() const {
 }
 
 /* -------------------------------------------------------- */
-/* summary                                                 */
+/* summary                                                  */
 
 void profiler::print_summary() const {
     std::cerr << "profiler summary ("

@@ -7,9 +7,12 @@
 
 #include <cmath>
 #include <iostream>
+#include <string>
+#include <type_traits>
 #include <vector>
 
-/* forward declarations from factor.cpp */
+/* -------------------------------------------------------- */
+/* forward declarations from factor.cpp                     */
 
 template <typename T>
 void solve_lu(gpu_context &ctx, T *d_lu, size_t n,
@@ -21,6 +24,26 @@ void solve_cholesky(gpu_context &ctx, T *d_l,
                     size_t n, T *d_b,
                     size_t nrhs, size_t batch);
 
+template <typename T>
+void solve_lu_trsm(gpu_context &ctx, T *d_lu,
+                   size_t n, rocblas_int *d_ipiv,
+                   T *d_b, size_t nrhs,
+                   size_t batch);
+
+template <typename T>
+void solve_cholesky_trsm(gpu_context &ctx, T *d_l,
+                          size_t n, T *d_b,
+                          size_t nrhs, size_t batch);
+
+/* -------------------------------------------------------- */
+/* solve variant                                            */
+
+enum class solve_variant : uint8_t {
+    rocblas,
+    rocblastrsv
+};
+
+/* -------------------------------------------------------- */
 /* pack_lu: reassemble packed LAPACK LU from
    separate L (unit lower) and U (upper) */
 
@@ -41,11 +64,12 @@ __global__ void pack_lu(const T *l, const T *u,
     lu[off] = (row > col) ? l[off] : u[off];
 }
 
-/* host-side residual: ||Ax - b|| / ||b|| */
+/* -------------------------------------------------------- */
+/* host-side residual: ||Ax - b|| / ||b||
+   always computed in fp64 for accuracy */
 
-template <typename T>
 static double compute_residual(
-    const T *A, const T *x, const T *b,
+    const double *A, const double *x, const double *b,
     size_t n, size_t nrhs, size_t batch_idx
 ) {
     size_t mat_off = batch_idx * n * n;
@@ -58,12 +82,12 @@ static double compute_residual(
         for (size_t i = 0; i < n; i++) {
             double ax = 0.0;
             for (size_t k = 0; k < n; k++) {
-                ax += (double)A[mat_off + k * n + i]
-                    * (double)x[rhs_off + j * n + k];
+                ax += A[mat_off + k * n + i]
+                    * x[rhs_off + j * n + k];
             }
-            double r = ax - (double)b[rhs_off + j * n + i];
+            double r = ax - b[rhs_off + j * n + i];
             norm_r += r * r;
-            double bi = (double)b[rhs_off + j * n + i];
+            double bi = b[rhs_off + j * n + i];
             norm_b += bi * bi;
         }
     }
@@ -71,11 +95,18 @@ static double compute_residual(
     return std::sqrt(norm_r) / std::sqrt(norm_b);
 }
 
-/* run_solve: profiled solve workflow */
+/* -------------------------------------------------------- */
+/* run_solve: profiled solve workflow
+
+   artifacts are always fp64 on disk. the template
+   parameter T sets the working precision for the
+   solve. data is cast from fp64 -> T before upload.
+   residual verification uses fp64 throughout. */
 
 template <typename T>
 void run_solve(gpu_context &ctx,
-               const profiler_config &cfg) {
+               const profiler_config &cfg,
+               solve_variant variant) {
     size_t n     = cfg.desc.n;
     size_t batch = cfg.desc.batch;
     size_t nrhs  = cfg.desc.nrhs;
@@ -83,30 +114,70 @@ void run_solve(gpu_context &ctx,
     size_t mat_elems = batch * n * n;
     size_t rhs_elems = batch * n * nrhs;
 
-    /* load artifact from disk */
+    bool do_verify =
+        cfg.mode == profile_mode::instrument_verify;
+
+    /* load fp64 artifacts from disk */
     std::string dir = artifact_directory(cfg.desc);
     std::cerr << "loading artifact from "
               << dir << "/\n";
 
-    std::vector<T> h_a(mat_elems);
-    std::vector<T> h_b(rhs_elems);
-    std::vector<T> h_l(mat_elems);
+    /* A and b kept in fp64 for verification */
+    std::vector<double> h_a_fp64;
+    std::vector<double> h_b_fp64(rhs_elems);
 
-    read_array(dir + "/a.bin",
-               h_a.data(), mat_elems * sizeof(T));
+    if (do_verify)
+        h_a_fp64.resize(mat_elems);
+    if (do_verify)
+        read_array(dir + "/a.bin",
+                   h_a_fp64.data(),
+                   mat_elems * sizeof(double));
+
     read_array(dir + "/b.bin",
-               h_b.data(), rhs_elems * sizeof(T));
-    read_array(dir + "/l.bin",
-               h_l.data(), mat_elems * sizeof(T));
+               h_b_fp64.data(),
+               rhs_elems * sizeof(double));
+
+    /* cast b to working precision */
+    std::vector<T> h_b(rhs_elems);
+    for (size_t i = 0; i < rhs_elems; i++)
+        h_b[i] = (T)h_b_fp64[i];
+
+    /* load factors, cast to working precision.
+       for T=double read directly to avoid a
+       large temporary buffer */
+    std::vector<T> h_l(mat_elems);
+    if constexpr (std::is_same_v<T, double>) {
+        read_array(dir + "/l.bin",
+                   h_l.data(),
+                   mat_elems * sizeof(double));
+    } else {
+        std::vector<double> tmp(mat_elems);
+        read_array(dir + "/l.bin",
+                   tmp.data(),
+                   mat_elems * sizeof(double));
+        for (size_t i = 0; i < mat_elems; i++)
+            h_l[i] = (T)tmp[i];
+    }
 
     std::vector<T> h_u;
     std::vector<rocblas_int> h_ipiv;
     if (cfg.desc.factor == factor_type::lu) {
         h_u.resize(mat_elems);
         h_ipiv.resize(batch * n);
-        read_array(dir + "/u.bin",
-                   h_u.data(),
-                   mat_elems * sizeof(T));
+
+        if constexpr (std::is_same_v<T, double>) {
+            read_array(dir + "/u.bin",
+                       h_u.data(),
+                       mat_elems * sizeof(double));
+        } else {
+            std::vector<double> tmp(mat_elems);
+            read_array(dir + "/u.bin",
+                       tmp.data(),
+                       mat_elems * sizeof(double));
+            for (size_t i = 0; i < mat_elems; i++)
+                h_u[i] = (T)tmp[i];
+        }
+
         read_array(dir + "/ipiv.bin",
                    h_ipiv.data(),
                    batch * n * sizeof(rocblas_int));
@@ -172,6 +243,25 @@ void run_solve(gpu_context &ctx,
     HIP_CHECK(hipStreamSynchronize(ctx.stream));
     std::cerr << "factors loaded and ready\n";
 
+    /* solve dispatch */
+    auto do_solve = [&]() {
+        if (cfg.desc.factor == factor_type::lu) {
+            if (variant == solve_variant::rocblastrsv)
+                solve_lu_trsm(ctx, d_factor, n,
+                    d_ipiv, d_x, nrhs, batch);
+            else
+                solve_lu(ctx, d_factor, n,
+                    d_ipiv, d_x, nrhs, batch);
+        } else {
+            if (variant == solve_variant::rocblastrsv)
+                solve_cholesky_trsm(ctx, d_factor,
+                    n, d_x, nrhs, batch);
+            else
+                solve_cholesky(ctx, d_factor, n,
+                    d_x, nrhs, batch);
+        }
+    };
+
     /* set up profiler and timers */
     profiler prof;
     prof.init(cfg, 1, 1);
@@ -179,13 +269,13 @@ void run_solve(gpu_context &ctx,
     gpu_timer timer;
     timer.init();
 
-    bool do_verify =
-        cfg.mode == profile_mode::instrument_verify;
-
-    /* buffer for verification */
-    std::vector<T> h_x;
-    if (do_verify)
-        h_x.resize(rhs_elems);
+    /* pre-allocate verification buffers */
+    std::vector<T> h_x_work;
+    std::vector<double> h_x_fp64;
+    if (do_verify) {
+        h_x_work.resize(rhs_elems);
+        h_x_fp64.resize(rhs_elems);
+    }
 
     /* warmup */
     std::cerr << "warmup (" << cfg.warmup_runs
@@ -196,13 +286,7 @@ void run_solve(gpu_context &ctx,
             rhs_elems * sizeof(T),
             hipMemcpyDeviceToDevice, ctx.stream));
 
-        if (cfg.desc.factor == factor_type::lu) {
-            solve_lu(ctx, d_factor, n, d_ipiv,
-                     d_x, nrhs, batch);
-        } else {
-            solve_cholesky(ctx, d_factor, n,
-                           d_x, nrhs, batch);
-        }
+        do_solve();
         HIP_CHECK(hipStreamSynchronize(ctx.stream));
     }
     prof.in_warmup = false;
@@ -218,13 +302,7 @@ void run_solve(gpu_context &ctx,
             hipMemcpyDeviceToDevice, ctx.stream));
 
         timer.start(ctx.stream);
-        if (cfg.desc.factor == factor_type::lu) {
-            solve_lu(ctx, d_factor, n, d_ipiv,
-                     d_x, nrhs, batch);
-        } else {
-            solve_cholesky(ctx, d_factor, n,
-                           d_x, nrhs, batch);
-        }
+        do_solve();
         timer.stop(ctx.stream);
         timer.synchronize();
 
@@ -232,18 +310,27 @@ void run_solve(gpu_context &ctx,
                              timer.elapsed_ms());
 
         if (do_verify) {
-            HIP_CHECK(hipMemcpy(h_x.data(), d_x,
+            HIP_CHECK(hipMemcpy(
+                h_x_work.data(), d_x,
                 rhs_elems * sizeof(T),
                 hipMemcpyDeviceToHost));
+
+            /* cast solution to fp64 for residual */
+            for (size_t i = 0; i < rhs_elems; i++)
+                h_x_fp64[i] = (double)h_x_work[i];
 
             double max_resid = 0.0;
             for (size_t i = 0; i < batch; i++) {
                 double res = compute_residual(
-                    h_a.data(), h_x.data(),
-                    h_b.data(), n, nrhs, i);
-                if (res > max_resid) max_resid = res;
+                    h_a_fp64.data(),
+                    h_x_fp64.data(),
+                    h_b_fp64.data(),
+                    n, nrhs, i);
+                if (res > max_resid)
+                    max_resid = res;
             }
-            prof.record_metric("residual", max_resid);
+            prof.record_metric("residual",
+                               max_resid);
         }
 
         prof.end_run();
@@ -265,11 +352,14 @@ void run_solve(gpu_context &ctx,
 }
 
 template void run_solve<double>(gpu_context &ctx,
-    const profiler_config &cfg);
+    const profiler_config &cfg,
+    solve_variant variant);
 template void run_solve<float>(gpu_context &ctx,
-    const profiler_config &cfg);
+    const profiler_config &cfg,
+    solve_variant variant);
 
-/* main */
+/* -------------------------------------------------------- */
+/* main                                                     */
 
 int main(int argc, char **argv) {
     profiler_cli_args args =
@@ -280,21 +370,41 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* parse solver name: {rocblas|rocblastrsv}{64|32} */
+    std::string solver = args.config.solver_name;
+    solve_variant variant;
+    bool use_fp32;
+
+    if (solver == "rocblas64") {
+        variant = solve_variant::rocblas;
+        use_fp32 = false;
+    } else if (solver == "rocblas32") {
+        variant = solve_variant::rocblas;
+        use_fp32 = true;
+    } else if (solver == "rocblastrsv64") {
+        variant = solve_variant::rocblastrsv;
+        use_fp32 = false;
+    } else if (solver == "rocblastrsv32") {
+        variant = solve_variant::rocblastrsv;
+        use_fp32 = true;
+    } else {
+        std::cerr << "error: unknown solver '"
+                  << solver << "'\n"
+                  << "valid: rocblas64, rocblas32, "
+                  << "rocblastrsv64, rocblastrsv32\n";
+        return 1;
+    }
+
+    if (use_fp32)
+        args.config.desc.working_prec = precision::fp32;
+
     gpu_context ctx;
     ctx.init();
 
-    switch (args.config.desc.working_prec) {
-        case precision::fp64:
-            run_solve<double>(ctx, args.config);
-            break;
-        case precision::fp32:
-            run_solve<float>(ctx, args.config);
-            break;
-        case precision::fp16:
-            std::cerr << "error: fp16 solve not "
-                      << "yet implemented\n";
-            return 1;
-    }
+    if (use_fp32)
+        run_solve<float>(ctx, args.config, variant);
+    else
+        run_solve<double>(ctx, args.config, variant);
 
     ctx.destroy();
     return 0;
