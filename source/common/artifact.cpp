@@ -32,6 +32,23 @@ std::string artifact_directory(const problem_descriptor &desc) {
          + "." + std::to_string(desc.nrhs);
 }
 
+void read_array(const std::string &path,
+                void *data, size_t bytes) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::cerr << "error: could not open "
+                  << path << " for reading\n";
+        exit(1);
+    }
+    in.read(static_cast<char *>(data), bytes);
+    if (!in) {
+        std::cerr << "error: failed reading "
+                  << bytes << " bytes from "
+                  << path << "\n";
+        exit(1);
+    }
+}
+
 void write_array(const std::string &path, const void *data, size_t bytes) {
     std::ofstream out(path, std::ios::binary);
     if (!out) {

@@ -1,29 +1,22 @@
 # Makefile for orc-ir cross-platform code
-#  
+#
 #
 #
 # ----------------------------------------------------------------- #
-# Build envrionment variables 
+# Build envrionment variables
 hostname = $(shell hostname -f)
 
-<<<<<<< HEAD
-environment_path      := ./.configure/environment
-toolkit_makefile_path := build
-target_directory      := target
-=======
 environment_directory      := ./.configure/environment
 toolkit_makefile_directory := build
 target_directory           := target
-source_directory		   := source
+source_directory           := source
 include_directory          := include
 object_directory           := object
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
 
-
-environment_file = $(environment_directory)/$(hostname) 
-ifneq ("$(wildcard $(environment_file))","") 
+environment_file = $(environment_directory)/$(hostname)
+ifneq ("$(wildcard $(environment_file))","")
     environment_exists := 1
-	-include $(environment_file) 
+	-include $(environment_file)
 	device := ${DEVICE}
 	toolkit := ${TOOLKIT}
 	toolkit_version := ${TOOLKIT_VERSION}
@@ -33,7 +26,7 @@ else
 endif
 
 toolkit_makefile_file = \
-	$(toolkit_makefile_directory)/$(toolkit).$(device) 
+	$(toolkit_makefile_directory)/$(toolkit).$(device)
 ifneq ("$(wildcard $(toolkit_makefile_file))","")
 	toolkit_makefile_exists := 1
 	-include $(toolkit_makefile_file)
@@ -45,27 +38,21 @@ target = $(target_directory)/$(environment_slug)/$(target_file)
 
 .DEFAULT_GOAL := all
 # ----------------------------------------------------------------- #
-<<<<<<< HEAD
 # Pretty printing and error reporting.
 
-=======
-.DEFAULT_GOAL := all
-# ----------------------------------------------------------------- #
-# Pretty printing and error reporting.
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
-# Ascii color variables 
+# Ascii color variables
 esc   := $(shell printf '\033')
 blue  := $(esc)[34m
 red   := $(esc)[31m
 reset := $(esc)[0m
-# Newline variable 
+# Newline variable
 define endl
 
 
 endef
 # Status function
 define status
-$(info $(blue)(make)$(reset)$(1))  
+$(info $(blue)(make)$(reset)$(1))
 endef
 # error funtction
 define failure
@@ -73,28 +60,22 @@ $(info $(red)(error)$(reset)$(1))
 @exit 2
 endef
 # ----------------------------------------------------------------- #
-<<<<<<< HEAD
 
-all: environment build-rules generate symlinks
+all: environment build-rules generate solve symlinks
 
-.PHONY: symlinks
-symlinks: generate
-	@ln -sf $(generate_bin) ./generate
-	$(call status, Symlinked latest build.)
-
-=======
-all: environment build-rules generate symlinks
 # ----------------------------------------------------------------- #
 .PHONY: symlinks
-symlinks: generate
+symlinks: generate solve
 	@ln -sf $(generate_bin) ./generate
+	@ln -sf $(solve_bin) ./solve
 	$(call status, Synchronized symbolic links to latest targets.\
 	$(endl)$(endl)\
-	$(blue)      generate ~ $(generate_bin)$(reset)$(endl))
+	$(blue)      generate ~ $(generate_bin)$(reset)$(endl)\
+	$(blue)      solve    ~ $(solve_bin)$(reset)$(endl))
+
 # ----------------------------------------------------------------- #
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
-# Verify that the envrionment file exists and is loaded. Otherwise, 
-# notify the user. 
+# Verify that the envrionment file exists and is loaded. Otherwise,
+# notify the user.
 .PHONY: environment
 environment:
 ifeq ($(environment_exists),1)
@@ -107,11 +88,7 @@ else
 	Add one to the environment directory; see the README $(endl)\
 	for further direction.)
 endif
-<<<<<<< HEAD
-
-=======
 # ----------------------------------------------------------------- #
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
 .PHONY: build-rules
 build-rules:
 ifeq ($(toolkit_makefile_exists),1)
@@ -124,19 +101,9 @@ else
 	Add one to the build directory; see the README for $(endl)\
 	further direction.)
 endif
-<<<<<<< HEAD
-=======
 # ----------------------------------------------------------------- #
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
 .PHONY: clean
 clean:
-	rm -rf object target ./generate
+	rm -rf object target ./generate ./solve
 	$(call status, Cleaned.)
-<<<<<<< HEAD
 # ----------------------------------------------------------------- #
-=======
-# ----------------------------------------------------------------- #
-#
-#
-#
->>>>>>> 74dd0ed457dfe6f96997ea643614fd5a3551e1de
