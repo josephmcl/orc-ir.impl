@@ -18,10 +18,11 @@ common_src := source/common/artifact.cpp \
               source/common/profiler.cpp
 
 # shared rocm sources (no main())
-rocm_lib_src := source/rocm/context.cpp \
-                source/rocm/factor.cpp  \
-                source/rocm/linalg.cpp  \
-                source/rocm/random.cpp  \
+rocm_lib_src := source/rocm/context.cpp  \
+                source/rocm/factor.cpp   \
+                source/rocm/ir_solve.cpp \
+                source/rocm/linalg.cpp   \
+                source/rocm/random.cpp   \
                 source/rocm/timer.cpp
 
 # ----------------------------------------------------------------- #

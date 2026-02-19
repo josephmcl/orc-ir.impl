@@ -117,6 +117,10 @@ void print_profiler_usage(const char *prog) {
            "rocblas trsm, fp64\n"
         << "         rocblastrsv32      "
            "rocblas trsm, fp32\n"
+        << "         ir3                "
+           "3-precision IR (chol only)\n"
+        << "  --iters N                "
+           "IR iterations (default: 10)\n"
         << "  --mode {profile|instrument"
            "|instrument_verify}\n"
         << "                           "
@@ -142,6 +146,7 @@ profiler_cli_args parse_profiler_args(
     args.config.environment_slug = ENVIRONMENT_SLUG;
     args.config.solver_name      = nullptr;
     args.help                    = false;
+    args.ir_iters                = 10;
 
     bool have_factor = false;
     bool have_n      = false;
@@ -205,6 +210,8 @@ profiler_cli_args parse_profiler_args(
             args.config.warmup_runs = std::stoul(val);
         } else if (arg == "--runs") {
             args.config.measured_runs = std::stoul(val);
+        } else if (arg == "--iters") {
+            args.ir_iters = std::stoul(val);
         } else {
             std::cerr << "error: unknown option '"
                       << arg << "'\n";

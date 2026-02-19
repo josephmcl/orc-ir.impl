@@ -18,6 +18,7 @@ void print_usage(const char *program_name);
 struct profiler_cli_args {
     profiler_config config;
     bool            help;
+    size_t          ir_iters;
 };
 
 profiler_cli_args parse_profiler_args(

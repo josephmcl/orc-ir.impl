@@ -36,11 +36,19 @@ void solve_cholesky_trsm(gpu_context &ctx, T *d_l,
                           size_t nrhs, size_t batch);
 
 /* -------------------------------------------------------- */
+/* forward declaration from ir_solve.cpp                    */
+
+void run_ir3_solve(gpu_context &ctx,
+                   const profiler_config &cfg,
+                   size_t max_ir_iters);
+
+/* -------------------------------------------------------- */
 /* solve variant                                            */
 
 enum class solve_variant : uint8_t {
     rocblas,
-    rocblastrsv
+    rocblastrsv,
+    ir3
 };
 
 /* -------------------------------------------------------- */
@@ -370,41 +378,49 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* parse solver name: {rocblas|rocblastrsv}{64|32} */
+    /* parse solver name */
     std::string solver = args.config.solver_name;
     solve_variant variant;
-    bool use_fp32;
+    bool use_fp32 = false;
 
     if (solver == "rocblas64") {
         variant = solve_variant::rocblas;
-        use_fp32 = false;
     } else if (solver == "rocblas32") {
         variant = solve_variant::rocblas;
         use_fp32 = true;
     } else if (solver == "rocblastrsv64") {
         variant = solve_variant::rocblastrsv;
-        use_fp32 = false;
     } else if (solver == "rocblastrsv32") {
         variant = solve_variant::rocblastrsv;
         use_fp32 = true;
+    } else if (solver == "ir3") {
+        variant = solve_variant::ir3;
     } else {
         std::cerr << "error: unknown solver '"
                   << solver << "'\n"
                   << "valid: rocblas64, rocblas32, "
-                  << "rocblastrsv64, rocblastrsv32\n";
+                  << "rocblastrsv64, rocblastrsv32"
+                  << ", ir3\n";
         return 1;
     }
 
     if (use_fp32)
-        args.config.desc.working_prec = precision::fp32;
+        args.config.desc.working_prec =
+            precision::fp32;
 
     gpu_context ctx;
     ctx.init();
 
-    if (use_fp32)
-        run_solve<float>(ctx, args.config, variant);
-    else
-        run_solve<double>(ctx, args.config, variant);
+    if (variant == solve_variant::ir3) {
+        run_ir3_solve(ctx, args.config,
+                      args.ir_iters);
+    } else if (use_fp32) {
+        run_solve<float>(ctx, args.config,
+                         variant);
+    } else {
+        run_solve<double>(ctx, args.config,
+                          variant);
+    }
 
     ctx.destroy();
     return 0;
