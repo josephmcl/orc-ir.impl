@@ -17,19 +17,20 @@ common_src := source/common/artifact.cpp \
               source/common/cli.cpp      \
               source/common/profiler.cpp
 
-rocm_src := source/rocm/generate.cpp \
-            source/rocm/factor.cpp    \
-            source/rocm/linalg.cpp    \
-            source/rocm/random.cpp    \
-            source/rocm/timer.cpp
+# shared rocm sources (no main())
+rocm_lib_src := source/rocm/context.cpp \
+                source/rocm/factor.cpp  \
+                source/rocm/linalg.cpp  \
+                source/rocm/random.cpp  \
+                source/rocm/timer.cpp
 
 # ----------------------------------------------------------------- #
 # object directory
 
 object_directory := object/$(environment_slug)
 
-common_obj := $(patsubst source/common/%.cpp,$(object_directory)/common/%.o,$(common_src))
-rocm_obj   := $(patsubst source/rocm/%.cpp,$(object_directory)/rocm/%.o,$(rocm_src))
+common_obj  := $(patsubst source/common/%.cpp,$(object_directory)/common/%.o,$(common_src))
+rocm_lib_obj := $(patsubst source/rocm/%.cpp,$(object_directory)/rocm/%.o,$(rocm_lib_src))
 
 # ----------------------------------------------------------------- #
 # directory creation
@@ -51,9 +52,18 @@ $(object_directory)/rocm/%.o: source/rocm/%.cpp | $(object_directory)/rocm
 
 generate_bin := $(target_directory)/$(environment_slug)/generate
 
-$(generate_bin): $(common_obj) $(rocm_obj) | $(target_directory)/$(environment_slug)
+$(generate_bin): $(common_obj) $(rocm_lib_obj) $(object_directory)/rocm/generate.o | $(target_directory)/$(environment_slug)
 	$(HIPCC) $(HIP_FLAGS) $^ $(HIP_LIBS) -o $@
 
 .PHONY: generate
 generate: $(generate_bin)
 	$(call status, Built generate -> $(generate_bin))
+
+solve_bin := $(target_directory)/$(environment_slug)/solve
+
+$(solve_bin): $(common_obj) $(rocm_lib_obj) $(object_directory)/rocm/solve.o | $(target_directory)/$(environment_slug)
+	$(HIPCC) $(HIP_FLAGS) $^ $(HIP_LIBS) -o $@
+
+.PHONY: solve
+solve: $(solve_bin)
+	$(call status, Built solve -> $(solve_bin))
