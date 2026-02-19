@@ -1088,10 +1088,6 @@ void run_ir3chol_solve(gpu_context &ctx,
                 ? rocblas_operation_none
                 : rocblas_operation_transpose;
 
-            auto do_trsv = (phase == 0)
-                ? phase_trsv_forward
-                : phase_trsv_backward;
-
             const double *h_true_ptr =
                 (phase == 0)
                     ? h_x_l.data()
@@ -1124,7 +1120,10 @@ void run_ir3chol_solve(gpu_context &ctx,
                     timers.stop(1, ctx.stream);
 
                     timers.start(2, ctx.stream);
-                    do_trsv();
+                    if (phase == 0)
+                        phase_trsv_forward();
+                    else
+                        phase_trsv_backward();
                     timers.stop(2, ctx.stream);
 
                     timers.start(3, ctx.stream);
@@ -1196,7 +1195,10 @@ void run_ir3chol_solve(gpu_context &ctx,
                      iter++) {
                     phase_residual();
                     phase_scale();
-                    do_trsv();
+                    if (phase == 0)
+                        phase_trsv_forward();
+                    else
+                        phase_trsv_backward();
                     phase_update();
                 }
 
@@ -1811,10 +1813,6 @@ void run_ir3lu_solve(gpu_context &ctx,
                 cur_inv_scale = inv_scale_u;
             }
 
-            auto do_trsv = (phase == 0)
-                ? phase_trsv_forward
-                : phase_trsv_backward;
-
             const double *h_true_ptr =
                 (phase == 0)
                     ? h_x_u.data()
@@ -1847,7 +1845,10 @@ void run_ir3lu_solve(gpu_context &ctx,
                     timers.stop(1, ctx.stream);
 
                     timers.start(2, ctx.stream);
-                    do_trsv();
+                    if (phase == 0)
+                        phase_trsv_forward();
+                    else
+                        phase_trsv_backward();
                     timers.stop(2, ctx.stream);
 
                     timers.start(3, ctx.stream);
@@ -1917,7 +1918,10 @@ void run_ir3lu_solve(gpu_context &ctx,
                      iter++) {
                     phase_residual();
                     phase_scale();
-                    do_trsv();
+                    if (phase == 0)
+                        phase_trsv_forward();
+                    else
+                        phase_trsv_backward();
                     phase_update();
                 }
 
