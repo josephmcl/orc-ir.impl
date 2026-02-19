@@ -51,11 +51,19 @@ void trsm_step(gpu_context &ctx,
                size_t batch);
 
 /* -------------------------------------------------------- */
-/* forward declaration from ir_solve.cpp                    */
+/* forward declarations from ir_solve.cpp                   */
 
 void run_ir3_solve(gpu_context &ctx,
                    const profiler_config &cfg,
                    size_t max_ir_iters);
+
+void run_ir3chol_solve(gpu_context &ctx,
+                       const profiler_config &cfg,
+                       size_t max_ir_iters);
+
+void run_ir3lu_solve(gpu_context &ctx,
+                     const profiler_config &cfg,
+                     size_t max_ir_iters);
 
 /* -------------------------------------------------------- */
 /* solve variant                                            */
@@ -63,7 +71,9 @@ void run_ir3_solve(gpu_context &ctx,
 enum class solve_variant : uint8_t {
     rocblas,
     rocblastrsv,
-    ir3
+    ir3,
+    ir3chol,
+    ir3lu
 };
 
 /* -------------------------------------------------------- */
@@ -495,12 +505,16 @@ int main(int argc, char **argv) {
         use_fp32 = true;
     } else if (solver == "ir3") {
         variant = solve_variant::ir3;
+    } else if (solver == "ir3chol") {
+        variant = solve_variant::ir3chol;
+    } else if (solver == "ir3lu") {
+        variant = solve_variant::ir3lu;
     } else {
         std::cerr << "error: unknown solver '"
                   << solver << "'\n"
                   << "valid: rocblas64, rocblas32, "
                   << "rocblastrsv64, rocblastrsv32"
-                  << ", ir3\n";
+                  << ", ir3, ir3chol, ir3lu\n";
         return 1;
     }
 
@@ -514,6 +528,12 @@ int main(int argc, char **argv) {
     if (variant == solve_variant::ir3) {
         run_ir3_solve(ctx, args.config,
                       args.ir_iters);
+    } else if (variant == solve_variant::ir3chol) {
+        run_ir3chol_solve(ctx, args.config,
+                          args.ir_iters);
+    } else if (variant == solve_variant::ir3lu) {
+        run_ir3lu_solve(ctx, args.config,
+                        args.ir_iters);
     } else if (use_fp32) {
         run_solve<float>(ctx, args.config,
                          variant);

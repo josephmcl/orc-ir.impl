@@ -234,6 +234,65 @@ void run_generate(gpu_context &ctx, const problem_descriptor &desc) {
             write_array(dir + "/ipiv.bin", h_ipiv.data(),
                         batch * n * sizeof(rocblas_int));
         }
+
+        /* compute x_u = U * x_true, the true
+           solution for LU phase 1 (L * y = Pb,
+           where y_true = U * x_true). used for
+           forward error in iterative refinement.
+           d_work = U, d_x = x_true. */
+        T *d_xu;
+        HIP_CHECK(hipMalloc(&d_xu,
+            rhs_elems * sizeof(T)));
+
+        T one  = (T)1;
+        T zero = (T)0;
+        for (size_t bi = 0; bi < batch; bi++) {
+            for (size_t j = 0; j < nrhs; j++) {
+                if constexpr (
+                    std::is_same_v<T, double>)
+                {
+                    ROCBLAS_CHECK(rocblas_dgemv(
+                        ctx.blas_handle,
+                        rocblas_operation_none,
+                        (rocblas_int)n,
+                        (rocblas_int)n,
+                        &one,
+                        d_work + bi * n * n,
+                        (rocblas_int)n,
+                        d_x + bi*n*nrhs + j*n, 1,
+                        &zero,
+                        d_xu + bi*n*nrhs + j*n,
+                        1));
+                } else {
+                    ROCBLAS_CHECK(rocblas_sgemv(
+                        ctx.blas_handle,
+                        rocblas_operation_none,
+                        (rocblas_int)n,
+                        (rocblas_int)n,
+                        &one,
+                        d_work + bi * n * n,
+                        (rocblas_int)n,
+                        d_x + bi*n*nrhs + j*n, 1,
+                        &zero,
+                        d_xu + bi*n*nrhs + j*n,
+                        1));
+                }
+            }
+        }
+        HIP_CHECK(hipStreamSynchronize(ctx.stream));
+
+        {
+            std::vector<T> host(rhs_elems);
+            HIP_CHECK(hipMemcpy(host.data(), d_xu,
+                rhs_elems * sizeof(T),
+                hipMemcpyDeviceToHost));
+            write_array(dir + "/x_u.bin",
+                host.data(), rhs_elems * sizeof(T));
+        }
+
+        HIP_CHECK(hipFree(d_xu));
+        std::cerr << "wrote " << dir
+                  << "/x_u.bin\n";
     } else {
         extract_lower<<<grid, block>>>(d_a, d_work, n, batch);
         HIP_CHECK(hipGetLastError());

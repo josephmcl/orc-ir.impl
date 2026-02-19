@@ -468,6 +468,234 @@ inline void launch_trsv_multiCU_fp16(
 }
 
 /* -------------------------------------------------------- */
+/* backward multi-CU block-column TRSV kernels
+   mirrors the forward TRSV but processes tiles
+   in reverse order (last to first) and solves
+   each diagonal block via backward substitution.
+
+   TRANSPOSE template parameter controls matrix
+   access:
+     true  = L^T (transposed lower, for Cholesky)
+     false = U  (upper triangular, for LU)            */
+
+/* backward diagonal solve: one block per batch
+   element solves the TILE_SIZE x TILE_SIZE
+   diagonal block bottom-to-top */
+
+template <int TILE_SIZE, int TPB, bool TRANSPOSE>
+__global__ void trsv_mc_diag_backward(
+    int n, int lda, long long strideA,
+    const _Float16 * __restrict__ A16,
+    int tile_idx,
+    float * __restrict__ rhs_ws,
+    float * __restrict__ x_ws,
+    long long stridex,
+    int batch)
+{
+    int sys = blockIdx.x;
+    if (sys >= batch) return;
+
+    const _Float16 *A0 =
+        A16 + (long long)sys * strideA;
+    float *rhs = rhs_ws + (long long)sys * stridex;
+    float *xw  = x_ws   + (long long)sys * stridex;
+
+    constexpr int WARP_SIZE = 64;
+    __shared__ float x_cache[TILE_SIZE];
+    __shared__ float warp_sums[TPB / WARP_SIZE];
+
+    int tile_start = tile_idx * TILE_SIZE;
+    int tile_end = (tile_start + TILE_SIZE < n)
+        ? (tile_start + TILE_SIZE) : n;
+    int tile_rows = tile_end - tile_start;
+
+    /* backward: process rows bottom-to-top */
+    for (int li = tile_rows - 1; li >= 0; li--) {
+        int i = tile_start + li;
+        float psum = 0.0f;
+
+        /* sum over columns AFTER i in the tile */
+        for (int j = li + 1 + (int)threadIdx.x;
+             j < tile_rows; j += TPB) {
+            int col = tile_start + j;
+            long long offset;
+            if constexpr (TRANSPOSE)
+                offset = col + (long long)i * lda;
+            else
+                offset = i + (long long)col * lda;
+            psum += (float)A0[offset]
+                  * x_cache[j];
+        }
+
+        int lane_id = threadIdx.x % WARP_SIZE;
+        int warp_id = threadIdx.x / WARP_SIZE;
+
+        #pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0;
+             off /= 2)
+            psum += __shfl_down(psum, off,
+                                WARP_SIZE);
+
+        if (lane_id == 0)
+            warp_sums[warp_id] = psum;
+        __syncthreads();
+
+        constexpr int num_warps = TPB / WARP_SIZE;
+        if (warp_id == 0) {
+            float v = (lane_id < num_warps)
+                ? warp_sums[lane_id] : 0.0f;
+            #pragma unroll
+            for (int off = num_warps / 2; off > 0;
+                 off >>= 1)
+                v += __shfl_down(v, off, num_warps);
+            if (lane_id == 0)
+                warp_sums[0] = v;
+        }
+        __syncthreads();
+        float total = warp_sums[0];
+
+        if (threadIdx.x == 0) {
+            float bi = rhs[i];
+            long long diag_off =
+                i + (long long)i * lda;
+            float Aii = (float)A0[diag_off];
+            float xi = (bi - total) / Aii;
+            x_cache[li] = xi;
+            xw[i] = xi;
+        }
+        __syncthreads();
+    }
+}
+
+/* backward column update: many blocks update
+   remaining rows ABOVE the diagonal tile */
+
+template <int TILE_SIZE, int TPB, bool TRANSPOSE>
+__global__ void trsv_mc_update_backward(
+    int n, int lda, long long strideA,
+    const _Float16 * __restrict__ A16,
+    int tile_idx,
+    const float * __restrict__ x_ws,
+    float * __restrict__ rhs_ws,
+    long long stridex,
+    int batch)
+{
+    int sys = blockIdx.y;
+    if (sys >= batch) return;
+
+    const _Float16 *A0 =
+        A16 + (long long)sys * strideA;
+    const float *xw =
+        x_ws + (long long)sys * stridex;
+    float *rhs =
+        rhs_ws + (long long)sys * stridex;
+
+    int tile_start = tile_idx * TILE_SIZE;
+    int tile_end = (tile_start + TILE_SIZE < n)
+        ? (tile_start + TILE_SIZE) : n;
+    int num_cols = tile_end - tile_start;
+
+    __shared__ float x_tile[TILE_SIZE];
+    for (int j = threadIdx.x; j < num_cols;
+         j += TPB)
+        x_tile[j] = xw[tile_start + j];
+    __syncthreads();
+
+    /* update rows ABOVE tile: [0, tile_start) */
+    int rem_rows = tile_start;
+
+    for (int idx = blockIdx.x * TPB + threadIdx.x;
+         idx < rem_rows;
+         idx += gridDim.x * TPB) {
+        int row = idx;
+        float update = 0.0f;
+
+        #pragma unroll 8
+        for (int j = 0; j < num_cols; j++) {
+            int col = tile_start + j;
+            long long offset;
+            if constexpr (TRANSPOSE)
+                offset = col + (long long)row * lda;
+            else
+                offset = row + (long long)col * lda;
+            update += (float)A0[offset] * x_tile[j];
+        }
+
+        rhs[row] -= update;
+    }
+}
+
+/* backward host-driven launcher: orchestrates
+   init → (diag + update) loop → finalize
+   in reverse tile order */
+
+template <int TILE_SIZE = MC_TRSV_TILE_SIZE,
+          int TPB = MC_TRSV_TPB,
+          bool TRANSPOSE = true>
+inline void launch_trsv_multiCU_fp16_backward(
+    hipStream_t stream,
+    int n, int lda, long long strideA,
+    const _Float16 *A16,
+    long long stridex,
+    _Float16 *x16,
+    int batch,
+    float *rhs_workspace,
+    float *x_workspace)
+{
+    int num_tiles =
+        (n + TILE_SIZE - 1) / TILE_SIZE;
+
+    /* init: fp16 RHS → fp32 workspace */
+    {
+        int nb = std::min(256,
+            (int)((n + TPB - 1) / TPB));
+        dim3 grid(nb, batch);
+        hipLaunchKernelGGL(
+            (trsv_mc_init_rhs<TPB>),
+            grid, dim3(TPB), 0, stream,
+            x16, rhs_workspace, stridex, n);
+    }
+
+    /* reverse block-column loop */
+    for (int tile = num_tiles - 1;
+         tile >= 0; tile--) {
+        hipLaunchKernelGGL(
+            (trsv_mc_diag_backward<
+                TILE_SIZE, TPB, TRANSPOSE>),
+            dim3(batch), dim3(TPB), 0, stream,
+            n, lda, strideA, A16, tile,
+            rhs_workspace, x_workspace,
+            stridex, batch);
+
+        int tile_start = tile * TILE_SIZE;
+        if (tile_start > 0) {
+            int nb = std::min(
+                MC_TRSV_MAX_UPD_BLOCKS,
+                (tile_start + TPB - 1) / TPB);
+            dim3 grid(nb, batch);
+            hipLaunchKernelGGL(
+                (trsv_mc_update_backward<
+                    TILE_SIZE, TPB, TRANSPOSE>),
+                grid, dim3(TPB), 0, stream,
+                n, lda, strideA, A16, tile,
+                x_workspace, rhs_workspace,
+                stridex, batch);
+        }
+    }
+
+    /* finalize: fp32 → fp16 */
+    {
+        int nb = std::min(256,
+            (int)((n + TPB - 1) / TPB));
+        dim3 grid(nb, batch);
+        hipLaunchKernelGGL(
+            (trsv_mc_finalize<TPB>),
+            grid, dim3(TPB), 0, stream,
+            x_workspace, x16, stridex, n);
+    }
+}
+
+/* -------------------------------------------------------- */
 /* host utilities                                           */
 
 /* next power of 2 >= x */
