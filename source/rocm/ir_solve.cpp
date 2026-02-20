@@ -2559,7 +2559,7 @@ void run_ir3A_solve(gpu_context &ctx,
                                 h_a.data(),
                                 h_x64.data(),
                                 h_b.data(),
-                                n, 1, bi);
+                                n, bi);
                         if (bwd > max_bwd)
                             max_bwd = bwd;
                         double fwd =
@@ -2629,6 +2629,495 @@ void run_ir3A_solve(gpu_context &ctx,
     if (is_lu) {
         HIP_CHECK(hipFree(d_u16));
         HIP_CHECK(hipFree(d_scale_u));
+        HIP_CHECK(hipFree(d_ipiv));
+    }
+    HIP_CHECK(hipFree(d_a));
+
+    std::cerr << "done.\n";
+}
+
+/* -------------------------------------------------------- */
+/* forward declarations from factor.cpp                     */
+
+template <typename T>
+void trsm_step(gpu_context &ctx,
+               rocblas_fill fill,
+               rocblas_operation trans,
+               rocblas_diagonal diag,
+               T *d_a, T *d_b,
+               size_t n, size_t nrhs,
+               size_t batch);
+
+/* -------------------------------------------------------- */
+/* run_ir3Af32_solve: Dongarra-Higham mixed-precision IR
+   with fp32 factors and rocBLAS TRSM.
+
+   precisions:
+     fp64: solution x, residual r = b - A*x
+     fp32: factor storage, TRSM solve
+
+   outer residual on A_64, inner solve via two
+   fp32 TRSM calls (rocblas_strsm). no pow2 scaling
+   needed — fp32 has sufficient dynamic range.
+
+   works with --factor chol or --factor lu.
+   requires nrhs=1.                                         */
+
+void run_ir3Af32_solve(gpu_context &ctx,
+                       const profiler_config &cfg,
+                       size_t max_ir_iters)
+{
+    size_t n     = cfg.desc.n;
+    size_t batch = cfg.desc.batch;
+    size_t nrhs  = cfg.desc.nrhs;
+    bool is_lu   =
+        cfg.desc.factor == factor_type::lu;
+
+    if (nrhs != 1) {
+        std::cerr << "error: ir3Af32 solver requires "
+                  << "nrhs=1\n";
+        exit(1);
+    }
+
+    size_t mat_elems = batch * n * n;
+    size_t vec_elems = batch * n;
+
+    bool instrument =
+        cfg.mode == profile_mode::instrument
+     || cfg.mode == profile_mode::instrument_verify;
+    bool do_verify =
+        cfg.mode == profile_mode::instrument_verify;
+
+    /* ---------------------------------------------------- */
+    /* load fp64 artifacts from disk                        */
+
+    std::string dir = artifact_directory(cfg.desc);
+    std::cerr << "loading artifacts from "
+              << dir << "/\n";
+
+    std::vector<double> h_a(mat_elems);
+    std::vector<double> h_l(mat_elems);
+    std::vector<double> h_b(vec_elems);
+
+    read_array(dir + "/a.bin",
+               h_a.data(),
+               mat_elems * sizeof(double));
+    read_array(dir + "/l.bin",
+               h_l.data(),
+               mat_elems * sizeof(double));
+    read_array(dir + "/b.bin",
+               h_b.data(),
+               vec_elems * sizeof(double));
+
+    std::vector<double> h_u;
+    std::vector<rocblas_int> h_ipiv;
+    if (is_lu) {
+        h_u.resize(mat_elems);
+        read_array(dir + "/u.bin",
+                   h_u.data(),
+                   mat_elems * sizeof(double));
+        h_ipiv.resize(batch * n);
+        read_array(dir + "/ipiv.bin",
+                   h_ipiv.data(),
+                   batch * n * sizeof(rocblas_int));
+    }
+
+    /* true solution for forward error */
+    std::vector<double> h_x_true;
+    if (do_verify) {
+        h_x_true.resize(vec_elems);
+        read_array(dir + "/x.bin",
+                   h_x_true.data(),
+                   vec_elems * sizeof(double));
+    }
+
+    /* ---------------------------------------------------- */
+    /* upload A (fp64) to GPU for residual dgemv            */
+
+    double *d_a;
+    HIP_CHECK(hipMalloc(&d_a,
+        mat_elems * sizeof(double)));
+    HIP_CHECK(hipMemcpy(d_a, h_a.data(),
+        mat_elems * sizeof(double),
+        hipMemcpyHostToDevice));
+
+    /* ---------------------------------------------------- */
+    /* demote factors to fp32 on host, upload               */
+
+    std::cerr << "demoting factors to fp32...\n";
+
+    std::vector<float> h_l32(mat_elems);
+    for (size_t i = 0; i < mat_elems; i++)
+        h_l32[i] = (float)h_l[i];
+
+    float *d_l32;
+    HIP_CHECK(hipMalloc(&d_l32,
+        mat_elems * sizeof(float)));
+    HIP_CHECK(hipMemcpy(d_l32, h_l32.data(),
+        mat_elems * sizeof(float),
+        hipMemcpyHostToDevice));
+
+    float *d_u32 = nullptr;
+    rocblas_int *d_ipiv = nullptr;
+
+    if (is_lu) {
+        std::vector<float> h_u32(mat_elems);
+        for (size_t i = 0; i < mat_elems; i++)
+            h_u32[i] = (float)h_u[i];
+
+        HIP_CHECK(hipMalloc(&d_u32,
+            mat_elems * sizeof(float)));
+        HIP_CHECK(hipMemcpy(d_u32, h_u32.data(),
+            mat_elems * sizeof(float),
+            hipMemcpyHostToDevice));
+
+        HIP_CHECK(hipMalloc(&d_ipiv,
+            batch * n * sizeof(rocblas_int)));
+        HIP_CHECK(hipMemcpy(
+            d_ipiv, h_ipiv.data(),
+            batch * n * sizeof(rocblas_int),
+            hipMemcpyHostToDevice));
+    }
+
+    /* ---------------------------------------------------- */
+    /* allocate solver workspace                            */
+
+    double *d_b, *d_x64, *d_r;
+    float *d_d32;
+
+    HIP_CHECK(hipMalloc(&d_b,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_x64,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_r,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_d32,
+        vec_elems * sizeof(float)));
+
+    int tpb = 256;
+    int nblocks_v =
+        (int)((vec_elems + tpb - 1) / tpb);
+
+    /* upload b */
+    HIP_CHECK(hipMemcpy(d_b, h_b.data(),
+        vec_elems * sizeof(double),
+        hipMemcpyHostToDevice));
+
+    HIP_CHECK(hipStreamSynchronize(ctx.stream));
+    std::cerr << "ir3Af32 solver ready (iters="
+              << max_ir_iters << ")\n";
+
+    /* ---------------------------------------------------- */
+    /* dgemv parameters                                     */
+
+    int lda = (int)n;
+    long long stride_a = (long long)n * n;
+    long long stride_x = (long long)n;
+
+    double alpha_neg = -1.0;
+    double beta_one  =  1.0;
+
+    /* ---------------------------------------------------- */
+    /* IR phase lambdas (GPU work only, no sync)            */
+
+    auto phase_residual = [&]() {
+        /* r = b - A*x64 (fp64 dgemv on full A) */
+        for (size_t bi = 0; bi < batch; bi++) {
+            HIP_CHECK(hipMemcpyAsync(
+                d_r + bi * stride_x,
+                d_b + bi * stride_x,
+                n * sizeof(double),
+                hipMemcpyDeviceToDevice,
+                ctx.stream));
+
+            ROCBLAS_CHECK(rocblas_dgemv(
+                ctx.blas_handle,
+                rocblas_operation_none,
+                (rocblas_int)n, (rocblas_int)n,
+                &alpha_neg,
+                d_a + bi * stride_a, lda,
+                d_x64 + bi * stride_x, 1,
+                &beta_one,
+                d_r + bi * stride_x, 1));
+        }
+
+        /* LU: apply pivots to residual */
+        if (is_lu) {
+            apply_pivots(ctx, d_r, n,
+                         d_ipiv, nrhs, batch);
+        }
+    };
+
+    auto phase_demote = [&]() {
+        hipLaunchKernelGGL(
+            gpu_demote_fp64_to_fp32_kernel,
+            dim3(nblocks_v), dim3(tpb),
+            0, ctx.stream,
+            d_r, d_d32, (int)vec_elems);
+    };
+
+    auto phase_trsv_forward = [&]() {
+        if (is_lu) {
+            trsm_step<float>(ctx,
+                rocblas_fill_lower,
+                rocblas_operation_none,
+                rocblas_diagonal_unit,
+                d_l32, d_d32, n, nrhs, batch);
+        } else {
+            trsm_step<float>(ctx,
+                rocblas_fill_lower,
+                rocblas_operation_none,
+                rocblas_diagonal_non_unit,
+                d_l32, d_d32, n, nrhs, batch);
+        }
+    };
+
+    auto phase_trsv_backward = [&]() {
+        if (is_lu) {
+            trsm_step<float>(ctx,
+                rocblas_fill_upper,
+                rocblas_operation_none,
+                rocblas_diagonal_non_unit,
+                d_u32, d_d32, n, nrhs, batch);
+        } else {
+            trsm_step<float>(ctx,
+                rocblas_fill_lower,
+                rocblas_operation_transpose,
+                rocblas_diagonal_non_unit,
+                d_l32, d_d32, n, nrhs, batch);
+        }
+    };
+
+    auto phase_update = [&]() {
+        hipLaunchKernelGGL(
+            gpu_promote_fp32_and_add_kernel,
+            dim3(nblocks_v), dim3(tpb),
+            0, ctx.stream,
+            d_d32, d_x64, (int)vec_elems);
+    };
+
+    /* ---------------------------------------------------- */
+    /* persistent labels for per-iteration recording        */
+
+    std::vector<std::string> time_strs;
+    std::vector<const char *> time_labels;
+    std::vector<std::string> verify_strs;
+    std::vector<const char *> verify_labels;
+
+    if (instrument) {
+        time_strs.resize(5 * max_ir_iters);
+        time_labels.resize(5 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            time_strs[5*i+0] = pfx + "residual";
+            time_strs[5*i+1] = pfx + "demote";
+            time_strs[5*i+2] = pfx + "fwd_trsm";
+            time_strs[5*i+3] = pfx + "bwd_trsm";
+            time_strs[5*i+4] = pfx + "update";
+            for (int j = 0; j < 5; j++)
+                time_labels[5*i+j] =
+                    time_strs[5*i+j].c_str();
+        }
+    }
+
+    if (do_verify) {
+        verify_strs.resize(2 * max_ir_iters);
+        verify_labels.resize(2 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            verify_strs[2*i+0] = pfx + "bwd_error";
+            verify_strs[2*i+1] = pfx + "fwd_error";
+            for (int j = 0; j < 2; j++)
+                verify_labels[2*i+j] =
+                    verify_strs[2*i+j].c_str();
+        }
+    }
+
+    /* ---------------------------------------------------- */
+    /* set up profiler and timers                           */
+
+    size_t events_per_run = instrument
+        ? 5 * max_ir_iters : 1;
+    size_t verify_per_run = do_verify
+        ? 2 * max_ir_iters : 0;
+
+    profiler prof;
+    prof.init(cfg, events_per_run, verify_per_run);
+
+    gpu_timer timer;
+    gpu_timer_pool timers;
+    if (instrument)
+        timers.init(5);
+    else
+        timer.init();
+
+    std::vector<double> h_x64;
+    if (do_verify)
+        h_x64.resize(vec_elems);
+
+    /* ---------------------------------------------------- */
+    /* warmup                                               */
+
+    std::cerr << "warmup (" << cfg.warmup_runs
+              << " runs)...\n";
+    prof.begin_warmup();
+    for (size_t w = 0; w < cfg.warmup_runs; w++) {
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
+
+        for (size_t iter = 0;
+             iter < max_ir_iters; iter++) {
+            phase_residual();
+            phase_demote();
+            phase_trsv_forward();
+            phase_trsv_backward();
+            phase_update();
+        }
+
+        HIP_CHECK(
+            hipStreamSynchronize(ctx.stream));
+    }
+    prof.in_warmup = false;
+
+    /* ---------------------------------------------------- */
+    /* measured runs                                        */
+
+    std::cerr << "profiling (" << cfg.measured_runs
+              << " runs)...\n";
+    for (size_t r = 0; r < cfg.measured_runs; r++) {
+        prof.begin_run();
+
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
+
+        if (instrument) {
+            HIP_CHECK(hipStreamSynchronize(
+                ctx.stream));
+
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                timers.reset();
+
+                timers.start(0, ctx.stream);
+                phase_residual();
+                timers.stop(0, ctx.stream);
+
+                timers.start(1, ctx.stream);
+                phase_demote();
+                timers.stop(1, ctx.stream);
+
+                timers.start(2, ctx.stream);
+                phase_trsv_forward();
+                timers.stop(2, ctx.stream);
+
+                timers.start(3, ctx.stream);
+                phase_trsv_backward();
+                timers.stop(3, ctx.stream);
+
+                timers.start(4, ctx.stream);
+                phase_update();
+                timers.stop(4, ctx.stream);
+
+                timers.synchronize_all();
+
+                prof.record_gpu_time(
+                    time_labels[5*iter+0],
+                    timers.elapsed_ms(0));
+                prof.record_gpu_time(
+                    time_labels[5*iter+1],
+                    timers.elapsed_ms(1));
+                prof.record_gpu_time(
+                    time_labels[5*iter+2],
+                    timers.elapsed_ms(2));
+                prof.record_gpu_time(
+                    time_labels[5*iter+3],
+                    timers.elapsed_ms(3));
+                prof.record_gpu_time(
+                    time_labels[5*iter+4],
+                    timers.elapsed_ms(4));
+
+                if (do_verify) {
+                    HIP_CHECK(hipMemcpy(
+                        h_x64.data(), d_x64,
+                        vec_elems *
+                            sizeof(double),
+                        hipMemcpyDeviceToHost));
+
+                    double max_bwd = 0.0;
+                    double max_fwd = 0.0;
+                    for (size_t bi = 0;
+                         bi < batch; bi++) {
+                        double bwd =
+                            compute_residual_full(
+                                h_a.data(),
+                                h_x64.data(),
+                                h_b.data(),
+                                n, bi);
+                        if (bwd > max_bwd)
+                            max_bwd = bwd;
+                        double fwd =
+                            compute_forward_error(
+                                h_x64.data(),
+                                h_x_true.data(),
+                                n, bi);
+                        if (fwd > max_fwd)
+                            max_fwd = fwd;
+                    }
+
+                    prof.record_metric(
+                        verify_labels[2*iter+0],
+                        max_bwd);
+                    prof.record_metric(
+                        verify_labels[2*iter+1],
+                        max_fwd);
+                }
+            }
+        } else {
+            /* profile mode: single timer around
+               entire IR solve */
+            timer.start(ctx.stream);
+
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                phase_residual();
+                phase_demote();
+                phase_trsv_forward();
+                phase_trsv_backward();
+                phase_update();
+            }
+
+            timer.stop(ctx.stream);
+            timer.synchronize();
+            prof.record_gpu_time("ir3Af32_solve",
+                timer.elapsed_ms());
+        }
+
+        prof.end_run();
+    }
+
+    prof.print_summary();
+    prof.write_csv();
+
+    /* ---------------------------------------------------- */
+    /* cleanup                                              */
+
+    if (instrument)
+        timers.destroy();
+    else
+        timer.destroy();
+    prof.destroy();
+
+    HIP_CHECK(hipFree(d_d32));
+    HIP_CHECK(hipFree(d_r));
+    HIP_CHECK(hipFree(d_x64));
+    HIP_CHECK(hipFree(d_b));
+    HIP_CHECK(hipFree(d_l32));
+    if (is_lu) {
+        HIP_CHECK(hipFree(d_u32));
         HIP_CHECK(hipFree(d_ipiv));
     }
     HIP_CHECK(hipFree(d_a));

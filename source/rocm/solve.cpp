@@ -69,6 +69,10 @@ void run_ir3A_solve(gpu_context &ctx,
                     const profiler_config &cfg,
                     size_t max_ir_iters);
 
+void run_ir3Af32_solve(gpu_context &ctx,
+                       const profiler_config &cfg,
+                       size_t max_ir_iters);
+
 /* -------------------------------------------------------- */
 /* solve variant                                            */
 
@@ -78,7 +82,8 @@ enum class solve_variant : uint8_t {
     ir3,
     ir3chol,
     ir3lu,
-    ir3A
+    ir3A,
+    ir3Af32
 };
 
 /* -------------------------------------------------------- */
@@ -516,13 +521,15 @@ int main(int argc, char **argv) {
         variant = solve_variant::ir3lu;
     } else if (solver == "ir3A") {
         variant = solve_variant::ir3A;
+    } else if (solver == "ir3Af32") {
+        variant = solve_variant::ir3Af32;
     } else {
         std::cerr << "error: unknown solver '"
                   << solver << "'\n"
                   << "valid: rocblas64, rocblas32, "
                   << "rocblastrsv64, rocblastrsv32"
                   << ", ir3, ir3chol, ir3lu"
-                  << ", ir3A\n";
+                  << ", ir3A, ir3Af32\n";
         return 1;
     }
 
@@ -545,6 +552,9 @@ int main(int argc, char **argv) {
     } else if (variant == solve_variant::ir3A) {
         run_ir3A_solve(ctx, args.config,
                        args.ir_iters);
+    } else if (variant == solve_variant::ir3Af32) {
+        run_ir3Af32_solve(ctx, args.config,
+                          args.ir_iters);
     } else if (use_fp32) {
         run_solve<float>(ctx, args.config,
                          variant);

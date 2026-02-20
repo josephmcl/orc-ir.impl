@@ -696,6 +696,34 @@ inline void launch_trsv_multiCU_fp16_backward(
 }
 
 /* -------------------------------------------------------- */
+/* gpu_demote_fp64_to_fp32_kernel:
+   out32[i] = (float)in64[i]                                */
+
+__global__ void gpu_demote_fp64_to_fp32_kernel(
+    const double * __restrict__ in64,
+    float * __restrict__ out32,
+    int N)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < N)
+        out32[gid] = (float)in64[gid];
+}
+
+/* -------------------------------------------------------- */
+/* gpu_promote_fp32_and_add_kernel:
+   x64[i] += (double)d32[i]                                 */
+
+__global__ void gpu_promote_fp32_and_add_kernel(
+    const float * __restrict__ d32,
+    double * __restrict__ x64,
+    int N)
+{
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid < N)
+        x64[gid] += (double)d32[gid];
+}
+
+/* -------------------------------------------------------- */
 /* host utilities                                           */
 
 /* next power of 2 >= x */
