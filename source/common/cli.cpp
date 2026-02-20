@@ -123,6 +123,8 @@ void print_profiler_usage(const char *prog) {
            "3-precision IR, full A=LL^T\n"
         << "         ir3lu              "
            "3-precision IR, full PA=LU\n"
+        << "         ir3A               "
+           "3-precision IR, A-resid + 2 TRSVs\n"
         << "  --iters N                "
            "IR iterations (default: 10)\n"
         << "  --mode {profile|instrument"

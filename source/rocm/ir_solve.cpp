@@ -2013,3 +2013,625 @@ void run_ir3lu_solve(gpu_context &ctx,
 
     std::cerr << "done.\n";
 }
+
+/* -------------------------------------------------------- */
+/* run_ir3A_solve: Higham 3-precision IR with full-system
+   residual r = b - A*x (fp64) and inner approximate
+   solve via two chained fp16 TRSVs.
+
+   Cholesky (--factor chol):
+     inner solve: L * y = r,  L^T * d = y
+   LU (--factor lu):
+     inner solve: L * y = P*r,  U * d = y
+
+   works with both --factor chol and --factor lu.
+   requires nrhs=1.                                         */
+
+void run_ir3A_solve(gpu_context &ctx,
+                    const profiler_config &cfg,
+                    size_t max_ir_iters)
+{
+    size_t n     = cfg.desc.n;
+    size_t batch = cfg.desc.batch;
+    size_t nrhs  = cfg.desc.nrhs;
+    bool is_lu   =
+        cfg.desc.factor == factor_type::lu;
+
+    if (nrhs != 1) {
+        std::cerr << "error: ir3A solver requires "
+                  << "nrhs=1\n";
+        exit(1);
+    }
+
+    size_t mat_elems = batch * n * n;
+    size_t vec_elems = batch * n;
+
+    bool instrument =
+        cfg.mode == profile_mode::instrument
+     || cfg.mode == profile_mode::instrument_verify;
+    bool do_verify =
+        cfg.mode == profile_mode::instrument_verify;
+
+    /* ---------------------------------------------------- */
+    /* load fp64 artifacts from disk                        */
+
+    std::string dir = artifact_directory(cfg.desc);
+    std::cerr << "loading artifacts from "
+              << dir << "/\n";
+
+    std::vector<double> h_a(mat_elems);
+    std::vector<double> h_l(mat_elems);
+    std::vector<double> h_b(vec_elems);
+
+    read_array(dir + "/a.bin",
+               h_a.data(),
+               mat_elems * sizeof(double));
+    read_array(dir + "/l.bin",
+               h_l.data(),
+               mat_elems * sizeof(double));
+    read_array(dir + "/b.bin",
+               h_b.data(),
+               vec_elems * sizeof(double));
+
+    std::vector<double> h_u;
+    std::vector<rocblas_int> h_ipiv;
+    if (is_lu) {
+        h_u.resize(mat_elems);
+        read_array(dir + "/u.bin",
+                   h_u.data(),
+                   mat_elems * sizeof(double));
+        h_ipiv.resize(batch * n);
+        read_array(dir + "/ipiv.bin",
+                   h_ipiv.data(),
+                   batch * n * sizeof(rocblas_int));
+    }
+
+    /* true solution for forward error */
+    std::vector<double> h_x_true;
+    if (do_verify) {
+        h_x_true.resize(vec_elems);
+        read_array(dir + "/x.bin",
+                   h_x_true.data(),
+                   vec_elems * sizeof(double));
+    }
+
+    /* ---------------------------------------------------- */
+    /* upload A (fp64) to GPU for residual dgemv            */
+
+    double *d_a;
+    HIP_CHECK(hipMalloc(&d_a,
+        mat_elems * sizeof(double)));
+    HIP_CHECK(hipMemcpy(d_a, h_a.data(),
+        mat_elems * sizeof(double),
+        hipMemcpyHostToDevice));
+
+    /* ---------------------------------------------------- */
+    /* upload L (fp64), demote to fp16                      */
+
+    double *d_l;
+    HIP_CHECK(hipMalloc(&d_l,
+        mat_elems * sizeof(double)));
+    HIP_CHECK(hipMemcpy(d_l, h_l.data(),
+        mat_elems * sizeof(double),
+        hipMemcpyHostToDevice));
+
+    std::cerr << "computing scaling factors...\n";
+    double max_abs_l = gpu_compute_max_abs(
+        d_l, (long long)mat_elems);
+    double scale_l = compute_optimal_fp16_scale(
+        max_abs_l);
+    double inv_scale_l = 1.0 / scale_l;
+
+    std::cerr << "  max(|L|) = " << max_abs_l
+              << ", scale_L = " << scale_l << "\n";
+
+    double *d_scale_l;
+    HIP_CHECK(hipMalloc(&d_scale_l,
+        sizeof(double)));
+    HIP_CHECK(hipMemcpy(d_scale_l, &scale_l,
+        sizeof(double), hipMemcpyHostToDevice));
+
+    _Float16 *d_l16;
+    HIP_CHECK(hipMalloc(&d_l16,
+        mat_elems * sizeof(_Float16)));
+
+    {
+        int tpb_d = 256;
+        long long size = (long long)mat_elems;
+        int nblocks =
+            (int)((size + tpb_d - 1) / tpb_d);
+
+        if (n >= (size_t)LARGE_PROBLEM_THRESHOLD) {
+            hipLaunchKernelGGL(
+                (gpu_scale_and_demote_kernel<
+                    long long>),
+                dim3(nblocks), dim3(tpb_d),
+                0, ctx.stream,
+                d_l, d_l16, d_scale_l, size);
+        } else {
+            hipLaunchKernelGGL(
+                (gpu_scale_and_demote_kernel<int>),
+                dim3(nblocks), dim3(tpb_d),
+                0, ctx.stream,
+                d_l, d_l16, d_scale_l,
+                (int)size);
+        }
+        HIP_CHECK(hipGetLastError());
+    }
+
+    /* can free fp64 L — only needed for demotion */
+    HIP_CHECK(hipFree(d_l));
+    d_l = nullptr;
+
+    /* ---------------------------------------------------- */
+    /* LU: upload U (fp64), demote to fp16, upload pivots   */
+
+    double *d_u = nullptr;
+    double *d_scale_u = nullptr;
+    _Float16 *d_u16 = nullptr;
+    rocblas_int *d_ipiv = nullptr;
+    double inv_scale_u = 0.0;
+
+    if (is_lu) {
+        HIP_CHECK(hipMalloc(&d_u,
+            mat_elems * sizeof(double)));
+        HIP_CHECK(hipMemcpy(d_u, h_u.data(),
+            mat_elems * sizeof(double),
+            hipMemcpyHostToDevice));
+
+        double max_abs_u = gpu_compute_max_abs(
+            d_u, (long long)mat_elems);
+        double scale_u =
+            compute_optimal_fp16_scale(max_abs_u);
+        inv_scale_u = 1.0 / scale_u;
+
+        std::cerr << "  max(|U|) = " << max_abs_u
+                  << ", scale_U = " << scale_u
+                  << "\n";
+
+        HIP_CHECK(hipMalloc(&d_scale_u,
+            sizeof(double)));
+        HIP_CHECK(hipMemcpy(d_scale_u, &scale_u,
+            sizeof(double),
+            hipMemcpyHostToDevice));
+
+        HIP_CHECK(hipMalloc(&d_u16,
+            mat_elems * sizeof(_Float16)));
+
+        {
+            int tpb_d = 256;
+            long long size = (long long)mat_elems;
+            int nblocks =
+                (int)((size + tpb_d - 1) / tpb_d);
+
+            if (n >=
+                (size_t)LARGE_PROBLEM_THRESHOLD) {
+                hipLaunchKernelGGL(
+                    (gpu_scale_and_demote_kernel<
+                        long long>),
+                    dim3(nblocks), dim3(tpb_d),
+                    0, ctx.stream,
+                    d_u, d_u16, d_scale_u, size);
+            } else {
+                hipLaunchKernelGGL(
+                    (gpu_scale_and_demote_kernel<
+                        int>),
+                    dim3(nblocks), dim3(tpb_d),
+                    0, ctx.stream,
+                    d_u, d_u16, d_scale_u,
+                    (int)size);
+            }
+            HIP_CHECK(hipGetLastError());
+        }
+
+        /* free fp64 U */
+        HIP_CHECK(hipFree(d_u));
+        d_u = nullptr;
+
+        /* upload pivots */
+        HIP_CHECK(hipMalloc(&d_ipiv,
+            batch * n * sizeof(rocblas_int)));
+        HIP_CHECK(hipMemcpy(
+            d_ipiv, h_ipiv.data(),
+            batch * n * sizeof(rocblas_int),
+            hipMemcpyHostToDevice));
+    }
+
+    /* ---------------------------------------------------- */
+    /* combined inverse-scale product for correction        */
+
+    double inv_scale_combined = is_lu
+        ? inv_scale_l * inv_scale_u
+        : inv_scale_l * inv_scale_l;
+
+    /* ---------------------------------------------------- */
+    /* allocate solver workspace                            */
+
+    double *d_b, *d_x64, *d_r;
+    _Float16 *d_x16;
+    float *d_workspace, *d_rhs_workspace;
+    double *d_block_maxes, *d_scale_b;
+    double *d_correction_scale, *d_norm;
+
+    HIP_CHECK(hipMalloc(&d_b,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_x64,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_r,
+        vec_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_x16,
+        vec_elems * sizeof(_Float16)));
+    HIP_CHECK(hipMalloc(&d_workspace,
+        vec_elems * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_rhs_workspace,
+        vec_elems * sizeof(float)));
+
+    int tpb = 256;
+    int nblocks_r =
+        (int)((vec_elems + tpb - 1) / tpb);
+    size_t shmem_size = sizeof(double) * tpb;
+
+    HIP_CHECK(hipMalloc(&d_block_maxes,
+        sizeof(double) * nblocks_r));
+    HIP_CHECK(hipMalloc(&d_scale_b,
+        sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_correction_scale,
+        sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_norm,
+        sizeof(double)));
+
+    /* upload b */
+    HIP_CHECK(hipMemcpy(d_b, h_b.data(),
+        vec_elems * sizeof(double),
+        hipMemcpyHostToDevice));
+
+    HIP_CHECK(hipStreamSynchronize(ctx.stream));
+    std::cerr << "IR3A solver ready (iters="
+              << max_ir_iters << ")\n";
+
+    /* ---------------------------------------------------- */
+    /* dgemv parameters                                     */
+
+    int lda = (int)n;
+    long long stride_a = (long long)n * n;
+    long long stride_x = (long long)n;
+
+    double alpha_neg = -1.0;
+    double beta_one  =  1.0;
+
+    /* ---------------------------------------------------- */
+    /* IR phase lambdas (GPU work only, no sync)            */
+
+    auto phase_residual = [&]() {
+        /* r = b - A*x64 (fp64 dgemv on full A) */
+        for (size_t bi = 0; bi < batch; bi++) {
+            HIP_CHECK(hipMemcpyAsync(
+                d_r + bi * stride_x,
+                d_b + bi * stride_x,
+                n * sizeof(double),
+                hipMemcpyDeviceToDevice,
+                ctx.stream));
+
+            ROCBLAS_CHECK(rocblas_dgemv(
+                ctx.blas_handle,
+                rocblas_operation_none,
+                (rocblas_int)n, (rocblas_int)n,
+                &alpha_neg,
+                d_a + bi * stride_a, lda,
+                d_x64 + bi * stride_x, 1,
+                &beta_one,
+                d_r + bi * stride_x, 1));
+        }
+
+        /* LU: apply pivots to residual r → P*r */
+        if (is_lu) {
+            apply_pivots(ctx, d_r, n,
+                         d_ipiv, nrhs, batch);
+        }
+    };
+
+    auto phase_scale = [&]() {
+        hipLaunchKernelGGL(
+            gpu_max_norm_kernel,
+            dim3(nblocks_r), dim3(tpb),
+            shmem_size, ctx.stream,
+            d_r, d_block_maxes,
+            (int)(vec_elems));
+
+        hipLaunchKernelGGL(
+            gpu_compute_pow2_scale_kernel,
+            dim3(1), dim3(1),
+            0, ctx.stream,
+            d_block_maxes, d_scale_b,
+            d_norm, nblocks_r);
+
+        hipLaunchKernelGGL(
+            gpu_apply_scale_and_demote_kernel,
+            dim3(nblocks_r), dim3(tpb),
+            0, ctx.stream,
+            d_r, d_x16, d_scale_b,
+            (int)(vec_elems));
+    };
+
+    auto phase_trsv_forward = [&]() {
+        launch_trsv_multiCU_fp16<
+            MC_TRSV_TILE_SIZE, MC_TRSV_TPB>(
+            ctx.stream,
+            (int)n, lda, stride_a, d_l16,
+            stride_x, d_x16, (int)batch,
+            d_rhs_workspace, d_workspace);
+    };
+
+    auto phase_trsv_backward = [&]() {
+        if (is_lu) {
+            launch_trsv_multiCU_fp16_backward<
+                MC_TRSV_TILE_SIZE, MC_TRSV_TPB,
+                false>(
+                ctx.stream,
+                (int)n, lda, stride_a, d_u16,
+                stride_x, d_x16, (int)batch,
+                d_rhs_workspace, d_workspace);
+        } else {
+            launch_trsv_multiCU_fp16_backward<
+                MC_TRSV_TILE_SIZE, MC_TRSV_TPB,
+                true>(
+                ctx.stream,
+                (int)n, lda, stride_a, d_l16,
+                stride_x, d_x16, (int)batch,
+                d_rhs_workspace, d_workspace);
+        }
+    };
+
+    auto phase_update = [&]() {
+        hipLaunchKernelGGL(
+            gpu_scalar_multiply_kernel,
+            dim3(1), dim3(1),
+            0, ctx.stream,
+            d_correction_scale,
+            d_scale_b, inv_scale_combined);
+
+        hipLaunchKernelGGL(
+            gpu_promote_and_add_kernel_devscale,
+            dim3(nblocks_r), dim3(tpb),
+            0, ctx.stream,
+            d_x16, d_x64,
+            d_correction_scale,
+            (int)(vec_elems));
+    };
+
+    /* ---------------------------------------------------- */
+    /* persistent labels for per-iteration recording        */
+
+    std::vector<std::string> time_strs;
+    std::vector<const char *> time_labels;
+    std::vector<std::string> verify_strs;
+    std::vector<const char *> verify_labels;
+
+    if (instrument) {
+        time_strs.resize(5 * max_ir_iters);
+        time_labels.resize(5 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            time_strs[5*i+0] = pfx + "residual";
+            time_strs[5*i+1] = pfx + "scale";
+            time_strs[5*i+2] = pfx + "fwd_trsv";
+            time_strs[5*i+3] = pfx + "bwd_trsv";
+            time_strs[5*i+4] = pfx + "update";
+            for (int j = 0; j < 5; j++)
+                time_labels[5*i+j] =
+                    time_strs[5*i+j].c_str();
+        }
+    }
+
+    if (do_verify) {
+        verify_strs.resize(2 * max_ir_iters);
+        verify_labels.resize(2 * max_ir_iters);
+        for (size_t i = 0; i < max_ir_iters; i++) {
+            std::string pfx =
+                "iter" + std::to_string(i) + "_";
+            verify_strs[2*i+0] = pfx + "bwd_error";
+            verify_strs[2*i+1] = pfx + "fwd_error";
+            for (int j = 0; j < 2; j++)
+                verify_labels[2*i+j] =
+                    verify_strs[2*i+j].c_str();
+        }
+    }
+
+    /* ---------------------------------------------------- */
+    /* set up profiler and timers                           */
+
+    size_t events_per_run = instrument
+        ? 5 * max_ir_iters : 1;
+    size_t verify_per_run = do_verify
+        ? 2 * max_ir_iters : 0;
+
+    profiler prof;
+    prof.init(cfg, events_per_run, verify_per_run);
+
+    gpu_timer timer;
+    gpu_timer_pool timers;
+    if (instrument)
+        timers.init(5);
+    else
+        timer.init();
+
+    std::vector<double> h_x64;
+    if (do_verify)
+        h_x64.resize(vec_elems);
+
+    /* ---------------------------------------------------- */
+    /* warmup                                               */
+
+    std::cerr << "warmup (" << cfg.warmup_runs
+              << " runs)...\n";
+    prof.begin_warmup();
+    for (size_t w = 0; w < cfg.warmup_runs; w++) {
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
+
+        for (size_t iter = 0;
+             iter < max_ir_iters; iter++) {
+            phase_residual();
+            phase_scale();
+            phase_trsv_forward();
+            phase_trsv_backward();
+            phase_update();
+        }
+
+        HIP_CHECK(
+            hipStreamSynchronize(ctx.stream));
+    }
+    prof.in_warmup = false;
+
+    /* ---------------------------------------------------- */
+    /* measured runs                                        */
+
+    std::cerr << "profiling (" << cfg.measured_runs
+              << " runs)...\n";
+    for (size_t r = 0; r < cfg.measured_runs; r++) {
+        prof.begin_run();
+
+        HIP_CHECK(hipMemsetAsync(d_x64, 0,
+            vec_elems * sizeof(double),
+            ctx.stream));
+
+        if (instrument) {
+            HIP_CHECK(hipStreamSynchronize(
+                ctx.stream));
+
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                timers.reset();
+
+                timers.start(0, ctx.stream);
+                phase_residual();
+                timers.stop(0, ctx.stream);
+
+                timers.start(1, ctx.stream);
+                phase_scale();
+                timers.stop(1, ctx.stream);
+
+                timers.start(2, ctx.stream);
+                phase_trsv_forward();
+                timers.stop(2, ctx.stream);
+
+                timers.start(3, ctx.stream);
+                phase_trsv_backward();
+                timers.stop(3, ctx.stream);
+
+                timers.start(4, ctx.stream);
+                phase_update();
+                timers.stop(4, ctx.stream);
+
+                timers.synchronize_all();
+
+                prof.record_gpu_time(
+                    time_labels[5*iter+0],
+                    timers.elapsed_ms(0));
+                prof.record_gpu_time(
+                    time_labels[5*iter+1],
+                    timers.elapsed_ms(1));
+                prof.record_gpu_time(
+                    time_labels[5*iter+2],
+                    timers.elapsed_ms(2));
+                prof.record_gpu_time(
+                    time_labels[5*iter+3],
+                    timers.elapsed_ms(3));
+                prof.record_gpu_time(
+                    time_labels[5*iter+4],
+                    timers.elapsed_ms(4));
+
+                if (do_verify) {
+                    HIP_CHECK(hipMemcpy(
+                        h_x64.data(), d_x64,
+                        vec_elems *
+                            sizeof(double),
+                        hipMemcpyDeviceToHost));
+
+                    double max_bwd = 0.0;
+                    double max_fwd = 0.0;
+                    for (size_t bi = 0;
+                         bi < batch; bi++) {
+                        double bwd =
+                            compute_residual_full(
+                                h_a.data(),
+                                h_x64.data(),
+                                h_b.data(),
+                                n, 1, bi);
+                        if (bwd > max_bwd)
+                            max_bwd = bwd;
+                        double fwd =
+                            compute_forward_error(
+                                h_x64.data(),
+                                h_x_true.data(),
+                                n, bi);
+                        if (fwd > max_fwd)
+                            max_fwd = fwd;
+                    }
+
+                    prof.record_metric(
+                        verify_labels[2*iter+0],
+                        max_bwd);
+                    prof.record_metric(
+                        verify_labels[2*iter+1],
+                        max_fwd);
+                }
+            }
+        } else {
+            /* profile mode: single timer around
+               entire IR solve */
+            timer.start(ctx.stream);
+
+            for (size_t iter = 0;
+                 iter < max_ir_iters; iter++) {
+                phase_residual();
+                phase_scale();
+                phase_trsv_forward();
+                phase_trsv_backward();
+                phase_update();
+            }
+
+            timer.stop(ctx.stream);
+            timer.synchronize();
+            prof.record_gpu_time("ir3A_solve",
+                timer.elapsed_ms());
+        }
+
+        prof.end_run();
+    }
+
+    prof.print_summary();
+    prof.write_csv();
+
+    /* ---------------------------------------------------- */
+    /* cleanup                                              */
+
+    if (instrument)
+        timers.destroy();
+    else
+        timer.destroy();
+    prof.destroy();
+
+    HIP_CHECK(hipFree(d_norm));
+    HIP_CHECK(hipFree(d_correction_scale));
+    HIP_CHECK(hipFree(d_scale_b));
+    HIP_CHECK(hipFree(d_block_maxes));
+    HIP_CHECK(hipFree(d_rhs_workspace));
+    HIP_CHECK(hipFree(d_workspace));
+    HIP_CHECK(hipFree(d_x16));
+    HIP_CHECK(hipFree(d_r));
+    HIP_CHECK(hipFree(d_x64));
+    HIP_CHECK(hipFree(d_b));
+    HIP_CHECK(hipFree(d_l16));
+    HIP_CHECK(hipFree(d_scale_l));
+    if (is_lu) {
+        HIP_CHECK(hipFree(d_u16));
+        HIP_CHECK(hipFree(d_scale_u));
+        HIP_CHECK(hipFree(d_ipiv));
+    }
+    HIP_CHECK(hipFree(d_a));
+
+    std::cerr << "done.\n";
+}
